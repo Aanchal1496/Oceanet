@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+ps67-project-outline.md
 
 # Frontend
 frontend/node_modules/
