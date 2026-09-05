@@ -1,0 +1,10 @@
+xarray
+netCDF4
+fastapi
+uvicorn
+requests
+cfgrib
+eccodes
+
+# Optional — only needed for CMEMS downloads
+# copernicusmarine
