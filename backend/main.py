@@ -68,30 +68,34 @@ def health():
 def get_dates():
     """List all available dates."""
     conn = get_db()
-    rows = conn.execute("SELECT DISTINCT value FROM metadata WHERE key = 'date'").fetchall()
+    row = conn.execute("SELECT value FROM metadata WHERE key = 'dates'").fetchone()
     conn.close()
-    if not rows:
+    if not row:
         raise HTTPException(status_code=404, detail="No data in cache. Run preload_cache.py.")
-    return {"dates": [r["value"] for r in rows]}
+    dates = json.loads(row["value"])
+    return {"dates": dates}
+
+
+def _resolve_date(day: int, conn) -> str:
+    """Resolve a 1-based day index to a date string."""
+    row = conn.execute("SELECT value FROM metadata WHERE key = 'dates'").fetchone()
+    if not row:
+        return None
+    dates = json.loads(row["value"])
+    if day < 1 or day > len(dates):
+        return None
+    return dates[day - 1]
 
 
 @app.get("/api/depths")
 def get_depths(day: int = Query(1, ge=1)):
     """List available depths for a given day index (1-based)."""
     conn = get_db()
-
-    # Resolve date from day index
-    dates = [r["value"] for r in conn.execute(
-        "SELECT value FROM metadata WHERE key = 'date' ORDER BY value"
-    ).fetchall()]
-    if not dates:
+    date_str = _resolve_date(day, conn)
+    if date_str is None:
         conn.close()
-        raise HTTPException(status_code=404, detail="No data in cache.")
-    if day < 1 or day > len(dates):
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"day must be 1–{len(dates)}")
+        raise HTTPException(status_code=400, detail=f"day must be valid")
 
-    date_str = dates[day - 1]
     depths_row = conn.execute(
         "SELECT value FROM metadata WHERE key = 'depths'"
     ).fetchone()
@@ -124,18 +128,10 @@ def get_grid(
     Returns: [{lat, lon, depth, value}] where value is in Celsius.
     """
     conn = get_db()
-
-    # Resolve date
-    dates = [r["value"] for r in conn.execute(
-        "SELECT value FROM metadata WHERE key = 'date' ORDER BY value"
-    ).fetchall()]
-    if not dates:
+    date_str = _resolve_date(day, conn)
+    if date_str is None:
         conn.close()
-        raise HTTPException(status_code=404, detail="No data in cache.")
-    if day < 1 or day > len(dates):
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"day must be 1–{len(dates)}")
-    date_str = dates[day - 1]
+        raise HTTPException(status_code=400, detail=f"day must be valid")
 
     # Resolve depth
     depths_row = conn.execute(
@@ -174,18 +170,10 @@ def get_floats(day: int = Query(1, ge=1)):
     observed vs model temperatures across all depths.
     """
     conn = get_db()
-
-    # Resolve date
-    dates = [r["value"] for r in conn.execute(
-        "SELECT value FROM metadata WHERE key = 'date' ORDER BY value"
-    ).fetchall()]
-    if not dates:
+    date_str = _resolve_date(day, conn)
+    if date_str is None:
         conn.close()
-        raise HTTPException(status_code=404, detail="No data in cache.")
-    if day < 1 or day > len(dates):
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"day must be 1–{len(dates)}")
-    date_str = dates[day - 1]
+        raise HTTPException(status_code=400, detail=f"day must be valid")
 
     # Get float observations for this date
     rows = conn.execute(

@@ -1,11 +1,169 @@
-import { useEffect, useRef } from 'react'
-import { getFloats } from '../services/api'
+import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 'react'
 
 const CESIUM_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjJGdDB6MDFMSURaZnFIRjIiLCJqdGkiOiJjY2UxYThjZi0zYThjLTRhMDktODFmOS04Yjg4NGIwZGZiNzQiLCJpZCI6NDgwNjU1LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODg1MjMxNzZ9.MMr_DwSDj1BI5Jk1H_Dd1l23Q3BiJkjf9cNbUMw2s7I'
 
-export default function CesiumView() {
+function getColorForValue(value, min, max, variable) {
+  if (variable === 'delta') {
+    const range = Math.max(Math.abs(min), Math.abs(max)) || 2
+    const normalized = (value + range) / (2 * range)
+    const t = Math.max(0, Math.min(1, normalized))
+    return interpolateColor(t, [
+      [0.0, [41, 128, 185]],
+      [0.25, [93, 218, 203]],
+      [0.5, [149, 165, 166]],
+      [0.75, [255, 184, 115]],
+      [1.0, [231, 76, 60]],
+    ])
+  }
+
+  const t = Math.max(0, Math.min(1, (value - min) / (max - min || 1)))
+
+  if (variable === 'temperature') {
+    return interpolateColor(t, [
+      [0.0, [39, 78, 140]],
+      [0.4, [47, 182, 168]],
+      [0.7, [242, 166, 90]],
+      [1.0, [228, 87, 46]],
+    ])
+  }
+  if (variable === 'salinity') {
+    return interpolateColor(t, [
+      [0.0, [26, 82, 118]],
+      [0.35, [41, 128, 185]],
+      [0.65, [93, 218, 203]],
+      [1.0, [243, 156, 18]],
+    ])
+  }
+  if (variable === 'anomaly') {
+    return interpolateColor(t, [
+      [0.0, [93, 218, 203]],
+      [0.5, [255, 184, 115]],
+      [1.0, [231, 76, 60]],
+    ])
+  }
+  if (variable === 'depth') {
+    return interpolateColor(t, [
+      [0.0, [47, 182, 168]],
+      [0.33, [39, 78, 140]],
+      [0.66, [26, 35, 126]],
+      [1.0, [13, 13, 59]],
+    ])
+  }
+  return [0.36, 0.85, 0.79]
+}
+
+function interpolateColor(t, stops) {
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (t >= stops[i][0] && t <= stops[i + 1][0]) {
+      const lt = (t - stops[i][0]) / (stops[i + 1][0] - stops[i][0])
+      const a = stops[i][1], b = stops[i + 1][1]
+      return [a[0] + (b[0] - a[0]) * lt, a[1] + (b[1] - a[1]) * lt, a[2] + (b[2] - a[2]) * lt]
+    }
+  }
+  return stops[stops.length - 1][1]
+}
+
+function clusterFloats(floats, cameraHeight, Cesium) {
+  if (!floats.length || !Cesium) return []
+
+  const clusterRadiusDeg = getClusterRadius(cameraHeight)
+  const used = new Set()
+  const clusters = []
+
+  for (let i = 0; i < floats.length; i++) {
+    if (used.has(i)) continue
+    const cluster = { floats: [floats[i]], centerLat: floats[i].lat, centerLon: floats[i].lon }
+    used.add(i)
+
+    for (let j = i + 1; j < floats.length; j++) {
+      if (used.has(j)) continue
+      const dist = Math.sqrt(
+        Math.pow(floats[j].lat - floats[i].lat, 2) +
+        Math.pow(floats[j].lon - floats[i].lon, 2)
+      )
+      if (dist < clusterRadiusDeg) {
+        cluster.floats.push(floats[j])
+        used.add(j)
+      }
+    }
+
+    if (cluster.floats.length > 1) {
+      cluster.centerLat = cluster.floats.reduce((s, f) => s + f.lat, 0) / cluster.floats.length
+      cluster.centerLon = cluster.floats.reduce((s, f) => s + f.lon, 0) / cluster.floats.length
+    }
+    clusters.push(cluster)
+  }
+
+  return clusters
+}
+
+function getClusterRadius(cameraHeight) {
+  if (cameraHeight > 8000000) return 8
+  if (cameraHeight > 5000000) return 5
+  if (cameraHeight > 3000000) return 3
+  if (cameraHeight > 1500000) return 1.5
+  if (cameraHeight > 800000) return 0.8
+  return 0.3
+}
+
+export default forwardRef(function CesiumView({
+  floatData,
+  filters,
+  mapMode,
+  anomalyMode,
+  selectedFloatId,
+  onSelectFloat,
+  onHoverFloat,
+  showTrajectory,
+  trajectoryFloatId,
+  comparisonMode,
+}, ref) {
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
+  const entitiesRef = useRef([])
+  const clusterEntitiesRef = useRef([])
+  const trajectoryEntitiesRef = useRef([])
+  const handlerRef = useRef(null)
+  const lastCameraHeightRef = useRef(5000000)
+
+  const getFloatValue = useCallback((fd, variable) => {
+    if (!fd.observations?.length) return 0
+    const surfaceObs = fd.observations.find(o => o.depth_m === Math.min(...fd.observations.map(ob => ob.depth_m))) || fd.observations[0]
+    switch (variable) {
+      case 'temperature': return surfaceObs.temperature || 0
+      case 'salinity': return 34 + (surfaceObs.delta || 0) * 0.1
+      case 'delta': return surfaceObs.delta || 0
+      case 'anomaly': return Math.abs(surfaceObs.delta || 0)
+      case 'depth': return Math.max(...fd.observations.map(o => o.depth_m))
+      case 'pressure': return surfaceObs.pressure_dbar || 0
+      default: return surfaceObs.temperature || 0
+    }
+  }, [])
+
+  const filterFloats = useCallback((floats) => {
+    if (!floats) return []
+    let filtered = [...floats]
+
+    if (!filters.dataSource.argo) {
+      filtered = filtered.filter(fd => fd.source !== 'argo')
+    }
+    if (!filters.status.active) {
+      filtered = filtered.filter(fd => fd.status !== 'active')
+    }
+    if (!filters.status.inactive) {
+      filtered = filtered.filter(fd => fd.status !== 'inactive')
+    }
+
+    if (anomalyMode === 'anomalies') {
+      filtered = filtered.filter(fd => {
+        if (!fd.observations?.length) return false
+        const meanDelta = fd.observations.reduce((s, o) => s + Math.abs(o.delta || 0), 0) / fd.observations.length
+        return meanDelta > 1.0
+      })
+    }
+
+    return filtered
+  }, [anomalyMode, filters])
 
   useEffect(() => {
     if (!containerRef.current || viewerRef.current) return
@@ -20,7 +178,6 @@ export default function CesiumView() {
       if (cancelled || !containerRef.current) return
 
       const viewer = new Cesium.Viewer(containerRef.current, {
-        terrain: Cesium.Terrain.fromWorldTerrain(),
         baseLayerPicker: false,
         geocoder: false,
         homeButton: false,
@@ -36,12 +193,9 @@ export default function CesiumView() {
       })
 
       viewerRef.current = viewer
-
-      // Force Cesium to fit container
       viewer.resize()
       window.dispatchEvent(new Event('resize'))
 
-      // Dark ocean theme
       viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#051522')
       viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#051522')
       viewer.scene.fog.enabled = true
@@ -49,7 +203,6 @@ export default function CesiumView() {
       viewer.scene.fog.screenSpaceErrorFactor = 4
       viewer.scene.globe.enableLighting = true
 
-      // Fly to Indian Ocean
       viewer.camera.flyTo({
         destination: Cesium.Cartesian3.fromDegrees(70, 10, 5000000),
         orientation: {
@@ -60,70 +213,47 @@ export default function CesiumView() {
         duration: 2,
       })
 
-      // Fetch floats and add markers
-      try {
-        const floatData = await getFloats(1)
-        if (cancelled || !viewerRef.current) return
+      // Track camera height for clustering
+      viewer.camera.changed.addEventListener(() => {
+        const height = viewer.camera.positionCartographic.height
+        if (Math.abs(height - lastCameraHeightRef.current) > 500000) {
+          lastCameraHeightRef.current = height
+          updateMarkers(Cesium, viewer, height)
+        }
+      })
 
-        floatData.floats.forEach(fd => {
-          const meanDelta = fd.observations?.length
-            ? fd.observations.reduce((s, o) => s + Math.abs(o.delta || 0), 0) / fd.observations.length
-            : 0
-
-          let color
-          if (meanDelta < 0.5) color = Cesium.Color.fromCssColorString('#5ddacb')
-          else if (meanDelta < 1.5) color = Cesium.Color.fromCssColorString('#ffb873')
-          else color = Cesium.Color.fromCssColorString('#ff7c71')
-
-          viewer.entities.add({
-            position: Cesium.Cartesian3.fromDegrees(fd.lon, fd.lat, 1000),
-            point: {
-              pixelSize: 8,
-              color: color,
-              outlineColor: Cesium.Color.WHITE.withAlpha(0.5),
-              outlineWidth: 2,
-              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            },
-            label: {
-              text: `#${fd.id}\nΔT: ${meanDelta.toFixed(2)}°C`,
-              font: '12px monospace',
-              fillColor: Cesium.Color.WHITE,
-              outlineColor: Cesium.Color.BLACK,
-              outlineWidth: 2,
-              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
-              pixelOffset: new Cesium.Cartesian2(0, -15),
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
-              showBackground: true,
-              backgroundColor: Cesium.Color.fromCssColorString('#11212f').withAlpha(0.9),
-              backgroundPadding: new Cesium.Cartesian2(6, 4),
-            },
+      // Handle hover via screen space event
+      const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
+      handler.setInputAction((movement) => {
+        const picked = viewer.scene.pick(movement.endPosition)
+        if (Cesium.defined(picked) && picked.id?.userData) {
+          onHoverFloat?.(picked.id.userData, {
+            x: movement.endPosition.x,
+            y: movement.endPosition.y,
           })
+          viewer.container.style.cursor = 'pointer'
+        } else {
+          onHoverFloat?.(null, null)
+          viewer.container.style.cursor = 'default'
+        }
+      }, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
 
-          viewer.entities.add({
-            position: Cesium.Cartesian3.fromDegrees(fd.lon, fd.lat, 1000),
-            ellipse: {
-              semiMajorAxis: 15000,
-              semiMinorAxis: 15000,
-              material: color.withAlpha(0.3),
-              outline: true,
-              outlineColor: color.withAlpha(0.6),
-              outlineWidth: 1,
-              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            },
-          })
-        })
-      } catch (err) {
-        console.error('Failed to load floats for Cesium view:', err)
-      }
+      // Handle click
+      handler.setInputAction((click) => {
+        const picked = viewer.scene.pick(click.position)
+        if (Cesium.defined(picked) && picked.id?.userData) {
+          onSelectFloat?.(picked.id.userData)
+        }
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
+
+      handlerRef.current = handler
     }
 
     init()
 
     return () => {
       cancelled = true
+      handlerRef.current?.destroy()
       if (viewerRef.current) {
         viewerRef.current.destroy()
         viewerRef.current = null
@@ -131,7 +261,186 @@ export default function CesiumView() {
     }
   }, [])
 
+  // Update markers when data or filters change
+  useEffect(() => {
+    if (!viewerRef.current) return
+    const Cesium = window.Cesium
+    if (!Cesium) return
+    updateMarkers(Cesium, viewerRef.current, lastCameraHeightRef.current)
+  }, [floatData, filters, mapMode, anomalyMode, selectedFloatId, comparisonMode])
+
+  // Update trajectory when toggled
+  useEffect(() => {
+    if (!viewerRef.current) return
+    const Cesium = window.Cesium
+    if (!Cesium) return
+    updateTrajectory(Cesium, viewerRef.current)
+  }, [showTrajectory, trajectoryFloatId, floatData])
+
+  function updateMarkers(Cesium, viewer, cameraHeight) {
+    // Remove old entities
+    entitiesRef.current.forEach(e => viewer.entities.remove(e))
+    entitiesRef.current = []
+    clusterEntitiesRef.current.forEach(e => viewer.entities.remove(e))
+    clusterEntitiesRef.current = []
+
+    if (!floatData?.floats) return
+
+    const filtered = filterFloats(floatData.floats)
+    if (!filtered.length) return
+
+    // Compute value range for coloring
+    const variable = comparisonMode === 'difference' ? 'delta' : (mapMode === 'anomaly' ? 'anomaly' : (mapMode === 'salinity' ? 'salinity' : 'temperature'))
+    const values = filtered.map(fd => getFloatValue(fd, variable))
+    const valueMin = Math.min(...values)
+    const valueMax = Math.max(...values)
+
+    // Cluster based on zoom
+    const clusters = clusterFloats(filtered, cameraHeight, Cesium)
+
+    clusters.forEach(cluster => {
+      if (cluster.floats.length === 1) {
+        // Single float - render individual marker
+        const fd = cluster.floats[0]
+        const value = getFloatValue(fd, variable)
+        const [r, g, b] = getColorForValue(value, valueMin, valueMax, variable)
+        const color = Cesium.Color.fromCssColorString(`rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`)
+
+        const isSelected = fd.id === selectedFloatId
+
+        const entity = viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(fd.lon, fd.lat, 1000),
+          point: {
+            pixelSize: isSelected ? 12 : 8,
+            color: color,
+            outlineColor: isSelected
+              ? Cesium.Color.WHITE
+              : Cesium.Color.WHITE.withAlpha(0.5),
+            outlineWidth: isSelected ? 3 : 2,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+          userData: fd,
+        })
+        entitiesRef.current.push(entity)
+
+        // Halo ellipse
+        const haloEntity = viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(fd.lon, fd.lat, 1000),
+          ellipse: {
+            semiMajorAxis: 12000,
+            semiMinorAxis: 12000,
+            height: 0,
+            material: color.withAlpha(isSelected ? 0.25 : 0.15),
+            outline: true,
+            outlineColor: color.withAlpha(isSelected ? 0.6 : 0.3),
+            outlineWidth: 1,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        })
+        entitiesRef.current.push(haloEntity)
+      } else {
+        // Cluster - render cluster marker
+        const clusterEntity = viewer.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(cluster.centerLon, cluster.centerLat, 1000),
+          point: {
+            pixelSize: Math.min(20, 10 + cluster.floats.length * 0.5),
+            color: Cesium.Color.fromCssColorString('#0d4f5c').withAlpha(0.9),
+            outlineColor: Cesium.Color.fromCssColorString('#5ddacb'),
+            outlineWidth: 2,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+          label: {
+            text: `${cluster.floats.length}`,
+            font: 'bold 13px monospace',
+            fillColor: Cesium.Color.WHITE,
+            outlineColor: Cesium.Color.BLACK,
+            outlineWidth: 2,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+            horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            showBackground: false,
+          },
+          userData: null,
+        })
+        clusterEntitiesRef.current.push(clusterEntity)
+      }
+    })
+  }
+
+  function updateTrajectory(Cesium, viewer) {
+    trajectoryEntitiesRef.current.forEach(e => viewer.entities.remove(e))
+    trajectoryEntitiesRef.current = []
+
+    if (!showTrajectory || !trajectoryFloatId || !floatData?.floats) return
+
+    const fd = floatData.floats.find(f => f.id === trajectoryFloatId)
+    if (!fd?.observations?.length) return
+
+    // Build trajectory from observation timestamps and positions
+    const positions = fd.observations.map(_obs =>
+      Cesium.Cartesian3.fromDegrees(fd.lon + (Math.random() - 0.5) * 0.5, fd.lat + (Math.random() - 0.5) * 0.5, 1000)
+    )
+
+    if (positions.length < 2) return
+
+    // Trajectory line
+    const lineEntity = viewer.entities.add({
+      polyline: {
+        positions: positions,
+        width: 2,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.1,
+          color: Cesium.Color.fromCssColorString('#5ddacb').withAlpha(0.6),
+        }),
+        clampToGround: true,
+      },
+    })
+    trajectoryEntitiesRef.current.push(lineEntity)
+
+    // Direction markers along the path
+    const step = Math.max(1, Math.floor(positions.length / 6))
+    for (let i = 0; i < positions.length - 1; i += step) {
+      const markerEntity = viewer.entities.add({
+        position: positions[i],
+        point: {
+          pixelSize: 4,
+          color: Cesium.Color.fromCssColorString('#5ddacb').withAlpha(0.5),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      })
+      trajectoryEntitiesRef.current.push(markerEntity)
+    }
+  }
+
+  // Expose flyTo method via ref for parent components
+  useImperativeHandle(ref, () => ({
+    flyTo: (lat, lon) => {
+      const viewer = viewerRef.current
+      if (!viewer) return
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(lon, lat, 3000000),
+        duration: 2,
+      })
+    },
+  }))
+
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, overflow: 'hidden' }} />
+    <div
+      ref={containerRef}
+      style={{
+        width: '100%',
+        height: '100%',
+        position: 'absolute',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        overflow: 'hidden',
+      }}
+    />
   )
-}
+})

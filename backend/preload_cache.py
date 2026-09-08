@@ -67,12 +67,14 @@ def create_tables(conn: sqlite3.Connection):
     """)
 
 
-def load_summary(conn: sqlite3.Connection) -> dict | None:
+def load_summaries() -> list[dict]:
+    """Load all summary files (one per day)."""
     summaries = sorted(PROCESSED_DIR.glob("summary_*.json"))
-    if not summaries:
-        return None
-    with open(summaries[-1]) as f:
-        return json.load(f)
+    all_summaries = []
+    for s in summaries:
+        with open(s) as f:
+            all_summaries.append(json.load(f))
+    return all_summaries
 
 
 def preload():
@@ -80,83 +82,88 @@ def preload():
     conn = sqlite3.connect(str(DB_PATH))
     create_tables(conn)
 
-    summary = load_summary(conn)
-    if not summary:
+    all_summaries = load_summaries()
+    if not all_summaries:
         print("No processed data found. Run process.py first.")
         conn.close()
         return
 
-    date_str = summary["date"]
+    # Collect all dates and depths across summaries
+    all_dates = sorted(set(s["date"] for s in all_summaries))
+    all_depths = sorted(set(
+        d["depth_m"] for s in all_summaries for d in s["depths_processed"]
+    ))
 
     # Store metadata
-    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("date", date_str))
-    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("grid_size", str(summary["grid_size"])))
-    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("source_file", summary["source_file"]))
-    depths_json = json.dumps([d["depth_m"] for d in summary["depths_processed"]])
+    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("dates", json.dumps(all_dates)))
+    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("grid_size", str(all_summaries[0]["grid_size"])))
+    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("source_file", all_summaries[0]["source_file"]))
+    depths_json = json.dumps(all_depths)
     conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("depths", depths_json))
 
     total_grid = 0
     total_obs = 0
 
-    for depth_info in summary["depths_processed"]:
-        depth_m = depth_info["depth_m"]
-        grid_file = PROCESSED_DIR / depth_info["grid_file"]
-        obs_file = PROCESSED_DIR / depth_info["obs_file"]
+    for summary in all_summaries:
+        date_str = summary["date"]
+        print(f"\n--- Loading {date_str} ---")
 
-        # Load grid
-        if grid_file.exists():
-            with open(grid_file) as f:
-                grid_data = json.load(f)
-            for pt in grid_data:
-                temp_celsius = pt["value"] - 273.15
-                conn.execute(
-                    "INSERT OR REPLACE INTO grid VALUES (?, ?, ?, ?, ?)",
-                    (date_str, depth_m, pt["lat"], pt["lon"], round(temp_celsius, 3)),
-                )
-            total_grid += len(grid_data)
-            print(f"  Grid {depth_info['grid_file']}: {len(grid_data)} points")
+        for depth_info in summary["depths_processed"]:
+            depth_m = depth_info["depth_m"]
+            grid_file = PROCESSED_DIR / depth_info["grid_file"]
+            obs_file = PROCESSED_DIR / depth_info["obs_file"]
 
-        # Load observations
-        if obs_file.exists() and obs_file.stat().st_size > 2:
-            with open(obs_file) as f:
-                obs_data = json.load(f)
-            for obs in obs_data:
-                conn.execute(
-                    """INSERT OR REPLACE INTO float_obs
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        obs["id"], date_str, depth_m,
-                        obs.get("pressure_dbar"), obs.get("temperature"),
-                        obs.get("model_temp"), obs.get("delta"),
-                        obs.get("nearest_grid_lat"), obs.get("nearest_grid_lon"),
-                        obs.get("distance_km"), obs.get("timestamp"),
-                    ),
-                )
-                # Upsert float summary
-                row = conn.execute(
-                    "SELECT lat, lon, first_seen, last_seen, record_count FROM floats WHERE id = ?",
-                    (obs["id"],),
-                ).fetchone()
-                if row is None:
+            # Load grid
+            if grid_file.exists():
+                with open(grid_file) as f:
+                    grid_data = json.load(f)
+                for pt in grid_data:
+                    temp_celsius = pt["value"] - 273.15
                     conn.execute(
-                        "INSERT INTO floats VALUES (?, ?, ?, ?, ?, ?)",
-                        (obs["id"], obs["lat"], obs["lon"],
-                         obs.get("timestamp"), obs.get("timestamp"), 1),
+                        "INSERT OR REPLACE INTO grid VALUES (?, ?, ?, ?, ?)",
+                        (date_str, depth_m, pt["lat"], pt["lon"], round(temp_celsius, 3)),
                     )
-                else:
-                    ts = obs.get("timestamp") or ""
-                    first = row[2] or ""
-                    last = row[3] or ""
-                    new_first = min(first, ts) if first else ts
-                    new_last = max(last, ts) if last else ts
+                total_grid += len(grid_data)
+
+            # Load observations
+            if obs_file.exists() and obs_file.stat().st_size > 2:
+                with open(obs_file) as f:
+                    obs_data = json.load(f)
+                for obs in obs_data:
                     conn.execute(
-                        "UPDATE floats SET lat=?, lon=?, first_seen=?, last_seen=?, record_count=record_count+1 WHERE id=?",
-                        (obs["lat"], obs["lon"], new_first, new_last, obs["id"]),
+                        """INSERT OR REPLACE INTO float_obs
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            obs["id"], date_str, depth_m,
+                            obs.get("pressure_dbar"), obs.get("temperature"),
+                            obs.get("model_temp"), obs.get("delta"),
+                            obs.get("nearest_grid_lat"), obs.get("nearest_grid_lon"),
+                            obs.get("distance_km"), obs.get("timestamp"),
+                        ),
                     )
-                total_obs += 1
-            print(f"  Obs {depth_info['obs_file']}: {len(obs_data)} records")
-        else:
-            print(f"  Obs {depth_info['obs_file']}: empty, skipping")
+                    # Upsert float summary
+                    row = conn.execute(
+                        "SELECT lat, lon, first_seen, last_seen, record_count FROM floats WHERE id = ?",
+                        (obs["id"],),
+                    ).fetchone()
+                    if row is None:
+                        conn.execute(
+                            "INSERT INTO floats VALUES (?, ?, ?, ?, ?, ?)",
+                            (obs["id"], obs["lat"], obs["lon"],
+                             obs.get("timestamp"), obs.get("timestamp"), 1),
+                        )
+                    else:
+                        ts = obs.get("timestamp") or ""
+                        first = row[2] or ""
+                        last = row[3] or ""
+                        new_first = min(first, ts) if first else ts
+                        new_last = max(last, ts) if last else ts
+                        conn.execute(
+                            "UPDATE floats SET lat=?, lon=?, first_seen=?, last_seen=?, record_count=record_count+1 WHERE id=?",
+                            (obs["lat"], obs["lon"], new_first, new_last, obs["id"]),
+                        )
+                    total_obs += 1
+                print(f"  {depth_info['obs_file']}: {len(obs_data)} records")
 
     conn.commit()
     conn.close()
@@ -164,8 +171,8 @@ def preload():
     print(f"\nCache built: {DB_PATH}")
     print(f"  Grid points: {total_grid}")
     print(f"  Observations: {total_obs}")
-    print(f"  Date: {date_str}")
-    print(f"  Depths: {[d['depth_m'] for d in summary['depths_processed']]}")
+    print(f"  Dates: {all_dates}")
+    print(f"  Depths: {all_depths}")
 
 
 if __name__ == "__main__":

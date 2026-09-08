@@ -1,8 +1,17 @@
-import { useState, useEffect, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
-import { getDepths, getGrid, getFloats, getFloatHistory } from '../services/api'
+import { getDates, getDepths, getGrid, getFloats } from '../services/api'
 import CesiumView from '../components/CesiumView'
+import LeftFilterPanel from '../components/LeftFilterPanel'
+import FloatDetailsPanel from '../components/FloatDetailsPanel'
+import MapLegend from '../components/MapLegend'
+import Timeline from '../components/Timeline'
+import MapModeSelector from '../components/MapModeSelector'
+import AnomalyToggle from '../components/AnomalyToggle'
+import FloatTooltip from '../components/FloatTooltip'
+import StatsBar from '../components/StatsBar'
+import FindRegionButton from '../components/FindRegionButton'
+import RegionResults from '../components/RegionResults'
 
 const N = 20, M = 20, SPACING = 0.5
 
@@ -24,8 +33,15 @@ function colorRamp(t) {
   return [c[0] / 255, c[1] / 255, c[2] / 255]
 }
 
+const DEFAULT_FILTERS = {
+  dataSource: { argo: true, godas: true, inSitu: false },
+  variable: 'temperature',
+  depth: 'all',
+  anomalyMode: 'all',
+  status: { active: true, inactive: false },
+}
+
 export default function Console() {
-  const navigate = useNavigate()
   const holderRef = useRef(null)
   const [loading, setLoading] = useState(true)
   const [loadingMsg, setLoadingMsg] = useState('Connecting to API...')
@@ -34,16 +50,29 @@ export default function Console() {
   const [activeDepthIdx, setActiveDepthIdx] = useState(0)
   const [activeDay, setActiveDay] = useState(1)
   const [totalDays, setTotalDays] = useState(1)
+  const [dates, setDates] = useState([])
   const [playing, setPlaying] = useState(false)
   const [disclaimer, setDisclaimer] = useState('Loading data from API...')
   const [selectedFloat, setSelectedFloat] = useState(null)
-  const [floatHistory, setFloatHistory] = useState(null)
-  const [cardOpen, setCardOpen] = useState(false)
-  const [viewMode, setViewMode] = useState('layers') // 'layers' | 'earth'
+  const [viewMode, setViewMode] = useState('earth')
+  const [presMode, setPresMode] = useState(false)
   const playRef = useRef(null)
   const activeDepthIdxRef = useRef(0)
 
-  // Store scene internals in a single ref to avoid stale closures
+  // New state for research UX
+  const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [filterCollapsed, setFilterCollapsed] = useState(false)
+  const [mapMode, setMapMode] = useState('floats')
+  const [anomalyMode, setAnomalyMode] = useState('all')
+  const [hoveredFloat, setHoveredFloat] = useState(null)
+  const [tooltipPos, setTooltipPos] = useState(null)
+  const [showTrajectory, setShowTrajectory] = useState(false)
+  const [trajectoryFloatId, setTrajectoryFloatId] = useState(null)
+  const [comparisonMode, setComparisonMode] = useState('absolute')
+  const [cesiumFloatData, setCesiumFloatData] = useState(null)
+  const [foundRegions, setFoundRegions] = useState(null)
+  const cesiumRef = useRef(null)
+
   const threeRef = useRef({
     scene: null, camera: null, renderer: null,
     depthMeshes: [], depthGeos: [], depthWireframes: [],
@@ -54,31 +83,44 @@ export default function Console() {
     globalMin: Infinity, globalMax: -Infinity,
     camTheta: 0.7, camPhi: 1.0, camRadius: 13,
     target: new THREE.Vector3(0, -2.2, 0),
-    targetY: -2.2,  // where the camera target should animate to
+    targetY: -2.2,
     dragging: false, lastX: 0, lastY: 0, downPos: null,
     selectedFloatMesh: null,
     availableDepthCount: 0,
   })
 
-  // Keep ref in sync
   useEffect(() => { activeDepthIdxRef.current = activeDepthIdx }, [activeDepthIdx])
 
-  // ── Init Three.js scene (runs once) ──
+  // ── Resize Three.js when switching to layer view ──
+  useEffect(() => {
+    if (viewMode !== 'layers') return
+    const T = threeRef.current
+    if (!T.renderer || !holderRef.current) return
+    // Small delay so the div has layout dimensions after becoming visible
+    const id = requestAnimationFrame(() => {
+      const holder = holderRef.current
+      if (!holder) return
+      T.camera.aspect = holder.clientWidth / holder.clientHeight
+      T.camera.updateProjectionMatrix()
+      T.renderer.setSize(holder.clientWidth, holder.clientHeight)
+    })
+    return () => cancelAnimationFrame(id)
+  }, [viewMode])
+
+  // ── Init Three.js scene ──
   useEffect(() => {
     if (!holderRef.current) return
-    const holder = holderRef.current
     const T = threeRef.current
+    if (T.scene) return // already initialized
+    const holder = holderRef.current
 
-    // Scene
     const scene = new THREE.Scene()
     scene.fog = new THREE.Fog(0x050b14, 8, 26)
     T.scene = scene
 
-    // Camera
     const camera = new THREE.PerspectiveCamera(45, holder.clientWidth / holder.clientHeight, 0.1, 100)
     T.camera = camera
 
-    // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
     renderer.setPixelRatio(window.devicePixelRatio)
     renderer.setSize(holder.clientWidth, holder.clientHeight)
@@ -96,33 +138,35 @@ export default function Console() {
     T.updateCamera = updateCamera
     updateCamera()
 
-    // ── Ambient light (needed if we switch to MeshPhongMaterial later) ──
     scene.add(new THREE.AmbientLight(0xffffff, 0.6))
 
-    // ── Pointer events ──
-    renderer.domElement.addEventListener('pointerdown', (e) => {
+    const onPointerDown = (e) => {
       T.dragging = true
       T.lastX = e.clientX; T.lastY = e.clientY
       T.downPos = { x: e.clientX, y: e.clientY }
-    })
-    window.addEventListener('pointerup', () => { T.dragging = false })
-    window.addEventListener('pointermove', (e) => {
+    }
+    const onPointerUp = () => { T.dragging = false }
+    const onPointerMove = (e) => {
       if (!T.dragging) return
       T.camTheta -= (e.clientX - T.lastX) * 0.006
       T.camPhi = Math.max(0.35, Math.min(1.5, T.camPhi - (e.clientY - T.lastY) * 0.006))
       T.lastX = e.clientX; T.lastY = e.clientY
       updateCamera()
-    })
-    renderer.domElement.addEventListener('wheel', (e) => {
+    }
+    const onWheel = (e) => {
       e.preventDefault()
       T.camRadius = Math.max(6, Math.min(24, T.camRadius + e.deltaY * 0.01))
       updateCamera()
-    }, { passive: false })
+    }
 
-    // ── Raycaster for float clicks ──
+    renderer.domElement.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('pointerup', onPointerUp)
+    window.addEventListener('pointermove', onPointerMove)
+    renderer.domElement.addEventListener('wheel', onWheel, { passive: false })
+
     const raycaster = new THREE.Raycaster()
     const mouse = new THREE.Vector2()
-    renderer.domElement.addEventListener('pointerup', (e) => {
+    const onFloatClick = (e) => {
       if (!T.downPos) return
       if (Math.hypot(e.clientX - T.downPos.x, e.clientY - T.downPos.y) > 5) return
       const rect = renderer.domElement.getBoundingClientRect()
@@ -135,17 +179,16 @@ export default function Console() {
         const fd = hits[0].object.userData
         T.selectedFloatMesh = hits[0].object
         setSelectedFloat(fd)
-        setCardOpen(true)
       } else {
         T.selectedFloatMesh = null
         setSelectedFloat(null)
-        setCardOpen(false)
-        setFloatHistory(null)
+        setShowTrajectory(false)
+        setTrajectoryFloatId(null)
       }
       updateFloatColors()
-    })
+    }
+    renderer.domElement.addEventListener('pointerup', onFloatClick)
 
-    // ── Resize ──
     const onResize = () => {
       camera.aspect = holder.clientWidth / holder.clientHeight
       camera.updateProjectionMatrix()
@@ -153,7 +196,6 @@ export default function Console() {
     }
     window.addEventListener('resize', onResize)
 
-    // ── Intro animation + render loop ──
     let introT = 0
     const introStart = { phi: 0.4, radius: 20 }
     const introEnd = { phi: 1.0, radius: 13 }
@@ -166,7 +208,6 @@ export default function Console() {
         T.camRadius = introStart.radius + (introEnd.radius - introStart.radius) * ease
         updateCamera()
       }
-      // Smooth camera target Y animation (lerp)
       const diff = T.targetY - T.target.y
       if (Math.abs(diff) > 0.01) {
         T.target.y += diff * 0.08
@@ -178,12 +219,16 @@ export default function Console() {
 
     return () => {
       window.removeEventListener('resize', onResize)
+      renderer.domElement.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('pointerup', onPointerUp)
+      window.removeEventListener('pointermove', onPointerMove)
+      renderer.domElement.removeEventListener('wheel', onWheel)
+      renderer.domElement.removeEventListener('pointerup', onFloatClick)
       renderer.dispose()
       if (holder.contains(renderer.domElement)) holder.removeChild(renderer.domElement)
+      T.scene = null
     }
-  }, [])
-
-  // ── Helper functions that use threeRef (no stale closures) ──
+  }, [viewMode])
 
   function buildGridGeometry() {
     const positions = new Float32Array(N * M * 3)
@@ -257,6 +302,7 @@ export default function Console() {
 
   function updateFloatColors() {
     const T = threeRef.current
+    if (!T.scene) return
     T.floatMeshes.forEach(({ mesh, data }) => {
       if (data.observations && data.observations.length > 0) {
         const meanDelta = data.observations.reduce((s, o) => s + Math.abs(o.delta || 0), 0) / data.observations.length
@@ -269,6 +315,7 @@ export default function Console() {
 
   function buildFloatMarkers() {
     const T = threeRef.current
+    if (!T.scene) return
     T.floatMeshes.forEach(m => { T.scene.remove(m.mesh); T.scene.remove(m.line) })
     T.floatMeshes = []
     if (!T.allFloatData || !T.allFloatData.floats || !T.gridLats.length) return
@@ -293,6 +340,7 @@ export default function Console() {
 
   function initDepthMeshes(depthCount) {
     const T = threeRef.current
+    if (!T.scene) return
     T.depthMeshes.forEach(m => T.scene.remove(m))
     T.depthWireframes.forEach(w => T.scene.remove(w))
     T.depthMeshes = []
@@ -322,10 +370,15 @@ export default function Console() {
       const T = threeRef.current
       try {
         setLoadingMsg('Connecting to API...')
+        const datesResp = await getDates()
+        if (cancelled) return
+        const numDays = datesResp.dates.length
+        setTotalDays(numDays)
+        setDates(datesResp.dates)
+
         const depthResp = await getDepths(1)
         if (cancelled) return
         setAvailableDepths(depthResp.depths)
-        setTotalDays(1)
 
         setLoadingMsg('Fetching grid data...')
         for (const d of depthResp.depths) {
@@ -338,6 +391,7 @@ export default function Console() {
         const floatData = await getFloats(1)
         if (cancelled) return
         T.allFloatData = floatData
+        setCesiumFloatData(floatData)
         setDisclaimer(`Live data from GODAS model + ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''} — Indian Ocean, July 2026.`)
 
         initDepthMeshes(depthResp.depths.length)
@@ -361,7 +415,6 @@ export default function Console() {
   useEffect(() => {
     updateGridColors()
     updateFloatColors()
-    // Animate camera to center on the selected layer
     const T = threeRef.current
     T.targetY = -activeDepthIdx * 2.4
   }, [activeDepthIdx])
@@ -378,21 +431,105 @@ export default function Console() {
     return () => clearInterval(playRef.current)
   }, [playing, totalDays])
 
-  // ── Fetch float history when selected ──
+  // ── Re-fetch data when day changes ──
   useEffect(() => {
-    if (selectedFloat) {
-      getFloatHistory(selectedFloat.id).then(setFloatHistory).catch(() => setFloatHistory(null))
-    }
-  }, [selectedFloat])
+    if (activeDay === 1 && threeRef.current.gridCache.size > 0) return
+    let cancelled = false
+    async function loadDay() {
+      const T = threeRef.current
+      try {
+        const depthResp = await getDepths(activeDay)
+        if (cancelled) return
 
-  // ── Reset camera ──
+        T.gridCache.clear()
+        for (const d of depthResp.depths) {
+          const grid = await getGrid({ variable: 'temperature', depth: d.depth_index, day: activeDay })
+          T.gridCache.set(d.depth_index, grid)
+        }
+        buildLatLonMaps()
+        computeColorRange()
+
+        const floatData = await getFloats(activeDay)
+        if (cancelled) return
+        T.allFloatData = floatData
+        setCesiumFloatData(floatData)
+
+        buildFloatMarkers()
+        updateGridColors()
+        updateFloatColors()
+
+        setDisclaimer(`Day ${activeDay} of ${totalDays} — ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''}, July 2026.`)
+      } catch (err) {
+        console.error('Failed to load day:', err)
+      }
+    }
+    loadDay()
+    return () => { cancelled = true }
+  }, [activeDay])
+
+  // ── Escape key exits presentation mode ──
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape' && presMode) setPresMode(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [presMode])
+
   function resetCamera() {
     const T = threeRef.current
     T.camTheta = 0.7; T.camPhi = 1.0; T.camRadius = 13
     T.updateCamera()
   }
 
+  // Handler for CesiumView hover
+  const handleHoverFloat = useCallback((float, pos) => {
+    setHoveredFloat(float)
+    setTooltipPos(pos)
+  }, [])
+
+  // Handler for CesiumView select
+  const handleSelectFloat = useCallback((float) => {
+    setSelectedFloat(float)
+  }, [])
+
+  // Handler for trajectory toggle
+  const handleShowTrajectory = useCallback((float) => {
+    if (showTrajectory && trajectoryFloatId === float.id) {
+      setShowTrajectory(false)
+      setTrajectoryFloatId(null)
+    } else {
+      setShowTrajectory(true)
+      setTrajectoryFloatId(float.id)
+    }
+  }, [showTrajectory, trajectoryFloatId])
+
+  // Handler for anomaly mode toggle
+  const handleAnomalyToggle = useCallback((mode) => {
+    setAnomalyMode(mode)
+    setFilters(prev => ({ ...prev, anomalyMode: mode }))
+  }, [])
+
+  // Handler for finding interesting regions
+  const handleFindRegions = useCallback((regions) => {
+    setFoundRegions(regions)
+  }, [])
+
+  // Handler for flying to a region (delegates to CesiumView)
+  const handleFlyToRegion = useCallback((lat, lon) => {
+    if (cesiumRef.current?.flyTo) {
+      cesiumRef.current.flyTo(lat, lon)
+    }
+  }, [])
+
   const depthLabels = ['Surface', 'Mid column', 'Deep', 'Deeper', 'Abyssal']
+
+  // Compute legend variable from mapMode
+  const legendVariable = mapMode === 'anomaly' ? 'anomaly'
+    : mapMode === 'salinity' ? 'salinity'
+    : comparisonMode === 'difference' ? 'delta'
+    : 'temperature'
+
+  // Float count from CesiumView data
+  const floatCount = cesiumFloatData?.float_count || 0
 
   return (
     <div className="h-screen w-screen bg-background overflow-hidden relative select-none">
@@ -412,6 +549,7 @@ export default function Console() {
       )}
 
       {/* Top HUD strip */}
+      {!presMode && (
       <div className="absolute top-2 left-3 right-3 z-30 flex items-center justify-between pointer-events-none">
         <div className="flex items-center gap-3 pointer-events-auto bg-surface-container-lowest/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-outline-variant/20 shadow-md">
           <div className="flex items-center gap-2">
@@ -428,7 +566,6 @@ export default function Console() {
           )}
         </div>
 
-        {/* Center: View Mode Toggle */}
         <div className="pointer-events-auto flex items-center bg-surface-container-lowest/80 backdrop-blur-md p-1 rounded-lg border border-outline-variant/20 shadow-md">
           <button
             onClick={() => setViewMode('layers')}
@@ -457,9 +594,29 @@ export default function Console() {
         <div className="flex items-center gap-2 pointer-events-auto">
           <div className="hidden md:flex items-center gap-2 bg-surface-container-lowest/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-outline-variant/20 shadow-md font-mono text-[12px]">
             <span className="text-on-surface-variant">Comparison:</span>
-            <span className="text-secondary font-medium">GODAS vs In-Situ Argo</span>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setComparisonMode('absolute')}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors cursor-pointer ${comparisonMode === 'absolute' ? 'bg-primary/15 text-primary' : 'text-on-surface-variant hover:text-on-surface'}`}
+              >
+                Absolute
+              </button>
+              <button
+                onClick={() => setComparisonMode('difference')}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors cursor-pointer ${comparisonMode === 'difference' ? 'bg-secondary/15 text-secondary' : 'text-on-surface-variant hover:text-on-surface'}`}
+              >
+                Δ Diff
+              </button>
+            </div>
           </div>
-          {viewMode === 'layers' && (
+          <button
+            onClick={() => setPresMode(!presMode)}
+            className="px-2.5 py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface text-[12px] font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <span className="material-symbols-outlined text-[15px]">{presMode ? 'fullscreen_exit' : 'fullscreen'}</span>
+            {presMode ? 'Exit Pres' : 'Present'}
+          </button>
+          {viewMode === 'layers' && !presMode && (
             <button
               onClick={resetCamera}
               className="px-2.5 py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface text-[12px] font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
@@ -469,21 +626,71 @@ export default function Console() {
           )}
         </div>
       </div>
-
-      {/* 3D Layer View (Three.js) */}
-      {viewMode === 'layers' && (
-        <div ref={holderRef} className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing" />
       )}
+
+      {/* 3D Layer View (Three.js) — always mounted, hidden when in earth mode */}
+      <div
+        ref={holderRef}
+        className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing"
+        style={{ display: viewMode === 'layers' ? 'block' : 'none' }}
+      />
 
       {/* 3D Earth View (Cesium) */}
       {viewMode === 'earth' && (
         <div className="absolute inset-0 z-0" style={{ width: '100%', height: '100%' }}>
-          <CesiumView />
+          <CesiumView
+            ref={cesiumRef}
+            floatData={cesiumFloatData}
+            filters={filters}
+            mapMode={mapMode}
+            anomalyMode={anomalyMode}
+            selectedFloatId={selectedFloat?.id}
+            onSelectFloat={handleSelectFloat}
+            onHoverFloat={handleHoverFloat}
+            showTrajectory={showTrajectory}
+            trajectoryFloatId={trajectoryFloatId}
+            comparisonMode={comparisonMode}
+          />
         </div>
       )}
 
-      {/* Left rail: controls (only for Layer view) */}
-      {viewMode === 'layers' && (
+      {/* Left Filter Panel (collapsible, both modes) */}
+      {!presMode && (
+        <LeftFilterPanel
+          filters={filters}
+          onFilterChange={setFilters}
+          collapsed={filterCollapsed}
+          onToggleCollapse={() => setFilterCollapsed(!filterCollapsed)}
+          availableDepths={availableDepths}
+        />
+      )}
+
+      {/* Map Mode Selector (earth view only, non-presentation) */}
+      {!presMode && viewMode === 'earth' && (
+        <MapModeSelector activeMode={mapMode} onModeChange={setMapMode} />
+      )}
+
+      {/* Stats Bar (earth view, non-presentation) */}
+      {!presMode && viewMode === 'earth' && (
+        <StatsBar floatData={cesiumFloatData} filters={filters} anomalyMode={anomalyMode} />
+      )}
+
+      {/* Find Interesting Region button (earth view, non-presentation) */}
+      {!presMode && viewMode === 'earth' && !foundRegions && (
+        <FindRegionButton floatData={cesiumFloatData} onFindRegions={handleFindRegions} />
+      )}
+
+      {/* Region Results panel */}
+      {!presMode && viewMode === 'earth' && foundRegions && (
+        <RegionResults
+          regions={foundRegions}
+          onFlyTo={handleFlyToRegion}
+          onClose={() => setFoundRegions(null)}
+        />
+      )}
+
+      {/* Left rail for Layer view controls */}
+      {!presMode && viewMode === 'layers' && (
       <div className="absolute top-14 left-3 z-20 w-56 flex flex-col gap-3 pointer-events-auto">
         <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
           <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Variable</span>
@@ -552,118 +759,64 @@ export default function Console() {
       </div>
       )}
 
+      {/* Map Legend */}
+      {!presMode && viewMode === 'earth' && (
+        <MapLegend variable={legendVariable} />
+      )}
+
+      {/* Anomaly Toggle */}
+      {!presMode && viewMode === 'earth' && (
+        <AnomalyToggle anomalyMode={anomalyMode} onToggle={handleAnomalyToggle} />
+      )}
+
+      {/* Float Tooltip (hover) */}
+      {!presMode && viewMode === 'earth' && (
+        <FloatTooltip float={hoveredFloat} position={tooltipPos} />
+      )}
+
+      {/* Float Details Panel (right side) */}
+      {!presMode && (
+        <FloatDetailsPanel
+          float={selectedFloat}
+          onClose={() => {
+            setSelectedFloat(null)
+            setFloatHistory(null)
+            setShowTrajectory(false)
+            setTrajectoryFloatId(null)
+            threeRef.current.selectedFloatMesh = null
+            updateFloatColors()
+          }}
+          onShowTrajectory={handleShowTrajectory}
+          trajectoryVisible={showTrajectory}
+          onCompareGodas={(_float) => {
+            setComparisonMode('difference')
+            setMapMode('floats')
+          }}
+        />
+      )}
+
       {/* Disclaimer banner */}
+      {!presMode && (
       <div className="absolute top-14 right-3 z-20 max-w-xs">
         <div className="bg-surface-container-lowest/80 backdrop-blur-md px-3 py-2 rounded-lg border border-outline-variant/20 shadow-md text-[11px] text-on-surface-variant font-mono leading-relaxed">
           {disclaimer}
         </div>
       </div>
+      )}
 
-      {/* Inspection card (right rail) */}
-      {cardOpen && selectedFloat && (
-        <aside className="absolute top-14 right-3 bottom-14 w-[400px] max-w-[calc(100vw-1.5rem)] z-30 flex flex-col bg-surface-container-lowest/95 shadow-xl backdrop-blur-sm transition-all duration-200">
-          <div className="px-4 py-3 bg-surface-container border-b border-outline-variant/20 flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-primary animate-pulse" />
-              <div>
-                <h3 className="text-[14px] font-bold text-on-surface leading-tight">Argo Float #{selectedFloat.id}</h3>
-                <p className="text-[11px] text-on-surface-variant font-mono">
-                  Active • ({selectedFloat.lat?.toFixed(2)}°, {selectedFloat.lon?.toFixed(2)}°)
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-1">
-              {selectedFloat.observations?.length > 0 && (
-                <span className="px-2 py-0.5 rounded-full bg-primary/15 text-primary text-[10px] font-semibold uppercase tracking-wider font-mono">Passed QC</span>
-              )}
-              <button onClick={() => { setCardOpen(false); setSelectedFloat(null); threeRef.current.selectedFloatMesh = null; updateFloatColors() }} className="text-on-surface-variant hover:text-on-surface p-1 rounded hover:bg-surface-container-high transition-colors cursor-pointer">
-                <span className="material-symbols-outlined text-[18px]">close</span>
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {floatHistory?.observations?.length > 0 ? (
-              <>
-                {floatHistory.observations.slice(0, 3).map((obs, i) => (
-                  <div key={i} className="p-3 rounded-lg bg-surface-container-low border border-outline-variant/20">
-                    <div className="text-[11px] font-mono text-on-surface-variant mb-2 flex items-center justify-between">
-                      <span>OBSERVATION @ {obs.depth_m}m</span>
-                      {obs.delta != null && (
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono ${Math.abs(obs.delta) > 1 ? 'bg-secondary/15 text-secondary' : 'bg-primary/15 text-primary'}`}>
-                          {obs.delta > 0 ? '+' : ''}{obs.delta.toFixed(2)}°C Δ
-                        </span>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="bg-surface-container p-2.5 rounded border-l-2 border-primary">
-                        <span className="text-[11px] text-on-surface-variant block font-mono">Observed</span>
-                        <span className="text-[18px] font-bold text-primary font-mono">{obs.temperature?.toFixed(2)}°C</span>
-                      </div>
-                      <div className="bg-surface-container p-2.5 rounded border-l-2 border-secondary">
-                        <span className="text-[11px] text-on-surface-variant block font-mono">Model</span>
-                        <span className="text-[18px] font-bold text-secondary font-mono">{obs.model_temp?.toFixed(2)}°C</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-
-                {floatHistory.observations.length > 1 && (
-                  <div className="p-3 rounded-lg bg-surface-container-low border border-outline-variant/20">
-                    <span className="text-[11px] font-mono text-on-surface-variant mb-2 block">TIME SERIES</span>
-                    <canvas
-                      ref={(canvas) => {
-                        if (!canvas) return
-                        const ctx = canvas.getContext('2d')
-                        const obs = floatHistory.observations
-                        const w = canvas.width = canvas.clientWidth * 2
-                        const h = canvas.height = 220
-                        ctx.clearRect(0, 0, w, h)
-                        const model = obs.map(o => o.model_temp)
-                        const observed = obs.map(o => o.temperature)
-                        const all = [...model, ...observed]
-                        const min = Math.min(...all) - 0.5, max = Math.max(...all) + 0.5
-                        const pL = 10, pR = 10, pT = 10, pB = 20
-                        const pW = w - pL - pR, pH = h - pT - pB
-                        const count = model.length
-                        function toXY(i, v) {
-                          return [pL + (count > 1 ? (i / (count - 1)) * pW : pW / 2), pT + (1 - (v - min) / (max - min)) * pH]
-                        }
-                        function drawLine(arr, color) {
-                          if (!arr.length) return
-                          ctx.beginPath()
-                          arr.forEach((v, i) => { const [x, y] = toXY(i, v); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) })
-                          ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.stroke()
-                          arr.forEach((v, i) => { const [x, y] = toXY(i, v); ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill() })
-                        }
-                        ctx.strokeStyle = '#16334a'; ctx.lineWidth = 1
-                        for (let g = 0; g <= 3; g++) { const y = pT + (g / 3) * pH; ctx.beginPath(); ctx.moveTo(pL, y); ctx.lineTo(w - pR, y); ctx.stroke() }
-                        drawLine(model, '#2fb6a8')
-                        drawLine(observed, '#f2a65a')
-                      }}
-                      className="w-full h-[110px] block"
-                    />
-                    <div className="flex gap-4 text-[11px] text-on-surface-variant mt-2">
-                      <span><span className="inline-block w-2 h-2 rounded-full bg-primary-container mr-1" />Model</span>
-                      <span><span className="inline-block w-2 h-2 rounded-full bg-secondary mr-1" />Observed</span>
-                    </div>
-                  </div>
-                )}
-
-                <button
-                  onClick={() => navigate(`/float/${selectedFloat.id}`)}
-                  className="w-full py-2 bg-surface-container hover:bg-surface-container-high text-on-surface text-[12px] font-semibold rounded border border-outline-variant/20 transition-colors cursor-pointer"
-                >
-                  View Full Float Profile →
-                </button>
-              </>
-            ) : (
-              <p className="text-sm text-on-surface-variant text-center py-8">No observation data available for this float.</p>
-            )}
-          </div>
-        </aside>
+      {/* Timeline (earth view, non-presentation) */}
+      {!presMode && viewMode === 'earth' && (
+        <Timeline
+          dates={dates}
+          activeDay={activeDay}
+          onDayChange={setActiveDay}
+          playing={playing}
+          onPlayToggle={() => setPlaying(!playing)}
+        />
       )}
 
       {/* Bottom dock */}
+      {!presMode && (
       <footer className="absolute bottom-0 left-0 right-0 h-12 z-30 bg-surface-container-lowest/95 backdrop-blur px-4 flex items-center justify-between border-t border-outline-variant/20">
         <div className="flex items-center gap-3">
           <button
@@ -673,7 +826,7 @@ export default function Console() {
             <span className="material-symbols-outlined text-[18px] text-primary">{playing ? 'pause' : 'play_arrow'}</span>
           </button>
           <span className="text-[11px] font-mono text-on-surface-variant">
-            {threeRef.current.floatMeshes.length} in-situ floats
+            {floatCount} in-situ floats
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -681,6 +834,66 @@ export default function Console() {
           <div className="h-1.5 w-32 rounded bg-gradient-to-r from-[#274e8c] via-[#2fb6a8] via-50% via-[#f2a65a] to-[#e4572e]" />
         </div>
       </footer>
+      )}
+
+      {/* Presentation mode bottom bar */}
+      {presMode && (
+      <div className="absolute bottom-0 left-0 right-0 z-40 bg-black/80 backdrop-blur-md px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="w-3 h-3 rounded-full bg-primary animate-pulse" />
+          <div>
+            <h2 className="text-[18px] font-bold text-white tracking-wide">Ocean State Console</h2>
+            <p className="text-[12px] text-white/60 font-mono">GODAS Model vs ARGO Floats — Indian Ocean</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <div className="flex gap-2">
+            {availableDepths.map((d, i) => (
+              <button
+                key={d.depth_index}
+                onClick={() => setActiveDepthIdx(i)}
+                className={`px-4 py-2 text-[14px] font-bold rounded-lg transition-all ${
+                  i === activeDepthIdx
+                    ? 'bg-primary text-white shadow-lg shadow-primary/30'
+                    : 'bg-white/10 text-white/70 hover:bg-white/20'
+                }`}
+              >
+                {depthLabels[i]}
+                <span className="ml-1.5 text-[11px] font-normal opacity-70">{d.depth_m}m</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="w-px h-8 bg-white/20" />
+
+          <button
+            onClick={() => setPlaying(!playing)}
+            className="w-12 h-12 rounded-full bg-primary hover:bg-primary/80 text-white flex items-center justify-center transition-colors shadow-lg shadow-primary/30 cursor-pointer"
+          >
+            <span className="material-symbols-outlined text-[28px]">{playing ? 'pause' : 'play_arrow'}</span>
+          </button>
+
+          <span className="text-[14px] font-mono text-white/80 min-w-[80px] text-center">
+            Day {activeDay} / {totalDays}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <div className="h-2 w-24 rounded bg-gradient-to-r from-[#274e8c] via-[#2fb6a8] via-[#f2a65a] to-[#e4572e]" />
+            <span className="text-[12px] text-white/60 font-mono">Cold → Warm</span>
+          </div>
+          <button
+            onClick={() => setPresMode(false)}
+            className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-[13px] font-semibold rounded-lg transition-colors cursor-pointer flex items-center gap-1.5"
+          >
+            <span className="material-symbols-outlined text-[16px]">fullscreen_exit</span>
+            Exit
+          </button>
+        </div>
+      </div>
+      )}
     </div>
   )
 }

@@ -108,27 +108,9 @@ def parse_profile(profile: dict) -> list[dict]:
     pressures = data[pres_idx]
     temperatures = data[temp_idx]
 
-    # Extract near-surface measurements (pressure < 20 dbar)
+    # Extract ALL measurements across all depths
     records = []
     for p, t in zip(pressures, temperatures):
-        if p is not None and t is not None and p < 20:
-            records.append({
-                "id": profile_id,
-                "lat": lat,
-                "lon": lon,
-                "timestamp": timestamp,
-                "pressure_dbar": round(p, 2),
-                "temperature_celsius": round(t, 3),
-            })
-
-    # If no near-surface data, take the shallowest measurement
-    if not records and pressures and temperatures:
-        min_pres_idx = 0
-        for i, p in enumerate(pressures):
-            if p is not None and (pressures[min_pres_idx] is None or p < pressures[min_pres_idx]):
-                min_pres_idx = i
-        p = pressures[min_pres_idx]
-        t = temperatures[min_pres_idx]
         if p is not None and t is not None:
             records.append({
                 "id": profile_id,

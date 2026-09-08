@@ -28,7 +28,7 @@ Usage:
 import argparse
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +42,7 @@ DEFAULT_LAT = (-10, 30)
 DEFAULT_LON = (40, 100)
 DEFAULT_GRID = 20        # 20×20 grid points
 DEFAULT_DEPTHS = [5, 50, 100, 200, 500]  # meters — good mix of surface + subsurface
+DEFAULT_DAYS = 7         # number of days to process
 
 
 # ── Load GODAS data ────────────────────────────────────────────────────────
@@ -221,6 +222,7 @@ def process(
     depths: list[float] | None = None,
     lat_range: tuple[float, float] = DEFAULT_LAT,
     lon_range: tuple[float, float] = DEFAULT_LON,
+    num_days: int = DEFAULT_DAYS,
 ):
     PROC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -244,16 +246,22 @@ def process(
     else:
         print("  WARNING: No ARGO JSON found. Skipping obs matching.")
 
-    # Extract date from filename for output naming
-    # Filename: godas.M.202607.grb -> stem: godas.M.202607
-    ym = grb_path.stem.split(".")[-1]  # "202607"
-    date_str = f"{ym[:4]}{ym[4:]}01"   # "20260701"
+    # Determine available dates from ARGO timestamps
+    if argo_records:
+        all_dates = sorted(set(r["timestamp"][:10] for r in argo_records if r.get("timestamp")))
+        # Take last num_days dates
+        process_dates = all_dates[-num_days:] if len(all_dates) >= num_days else all_dates
+    else:
+        # Fallback: use first day of the month
+        ym = grb_path.stem.split(".")[-1]
+        process_dates = [f"{ym[:4]}-{ym[4:]}-01"]
 
     print(f"\n=== Processing {grb_path.name} ===")
     print(f"    Grid: {grid_size}×{grid_size}, Depths: {depths}")
-    print(f"    Region: {lat_range[0]}–{lat_range[1]}°N, {lon_range[0]}–{lon_range[1]}°E\n")
+    print(f"    Region: {lat_range[0]}–{lat_range[1]}°N, {lon_range[0]}–{lon_range[1]}°E")
+    print(f"    Days: {len(process_dates)} ({process_dates[0]} to {process_dates[-1]})\n")
 
-    # Load and subset
+    # Load and subset GODAS (same for all days — monthly mean)
     ds = load_godas(grb_path)
     ds_sub = subset_indian_ocean(ds, lat_range, lon_range)
     pt = ds_sub.pt  # potential temperature in Kelvin
@@ -265,10 +273,9 @@ def process(
     available_depths = ds_sub.depthBelowSea.values
     valid_depths = []
     for d in depths:
-        # Find nearest available depth
         idx = np.argmin(np.abs(available_depths - d))
         actual_depth = available_depths[idx]
-        if abs(actual_depth - d) < 50:  # within 50m tolerance
+        if abs(actual_depth - d) < 50:
             valid_depths.append((d, actual_depth))
             print(f"    Requested {d}m -> using {actual_depth}m")
         else:
@@ -278,62 +285,68 @@ def process(
         print("  ERROR: No valid depths found.")
         return
 
-    # Process each depth
-    summary = {
-        "date": date_str,
-        "source_file": grb_path.name,
-        "region": {"lat": list(lat_range), "lon": list(lon_range)},
-        "grid_size": grid_size,
-        "depths_processed": [],
-    }
-
+    # Pre-compute grid for each depth (same for all days)
+    depth_grids = {}
     for target_depth, actual_depth in valid_depths:
         depth_idx = np.argmin(np.abs(available_depths - actual_depth))
         slice_2d = pt.isel(depthBelowSea=depth_idx)
-
-        # Downsample
         grid_records = downsample_grid(slice_2d, grid_size, actual_depth)
+        depth_grids[actual_depth] = grid_records
         print(f"\n  Depth {actual_depth}m: {len(grid_records)} grid points")
 
-        # Save grid JSON
-        grid_file = PROC_DIR / f"grid_{date_str}_d{int(actual_depth)}m.json"
-        with open(grid_file, "w") as f:
-            json.dump(grid_records, f)
-        print(f"    -> {grid_file.name} ({grid_file.stat().st_size / 1e3:.1f} KB)")
+    # Process each day
+    all_summaries = []
+    for day_str in process_dates:
+        date_compact = day_str.replace("-", "")
+        print(f"\n--- Day {day_str} ---")
 
-        # Match ARGO observations
-        obs_file = PROC_DIR / f"obs_{date_str}_d{int(actual_depth)}m.json"
-        if argo_records:
-            matched = match_obs_to_grid_detailed(argo_records, grid_records, actual_depth)
-            with open(obs_file, "w") as f:
-                json.dump(matched, f, indent=2)
-            print(f"    -> {obs_file.name}: {len(matched)} matched obs")
+        # Filter ARGO records for this day
+        day_argo = [r for r in argo_records if r.get("timestamp", "").startswith(day_str)] if argo_records else []
 
-            # Print delta stats
-            if matched:
-                deltas = [m["delta"] for m in matched]
-                mean_delta = sum(deltas) / len(deltas)
-                max_delta = max(abs(d) for d in deltas)
-                print(f"       mean delta: {mean_delta:+.2f}°C, max |delta|: {max_delta:.2f}°C")
-        else:
-            with open(obs_file, "w") as f:
-                json.dump([], f)
+        summary = {
+            "date": date_compact,
+            "source_file": grb_path.name,
+            "region": {"lat": list(lat_range), "lon": list(lon_range)},
+            "grid_size": grid_size,
+            "depths_processed": [],
+        }
 
-        summary["depths_processed"].append({
-            "depth_m": int(actual_depth),
-            "grid_points": len(grid_records),
-            "matched_obs": len(matched) if argo_records else 0,
-            "grid_file": grid_file.name,
-            "obs_file": obs_file.name,
-        })
+        for target_depth, actual_depth in valid_depths:
+            grid_records = depth_grids[actual_depth]
 
-    # Save summary
-    summary_file = PROC_DIR / f"summary_{date_str}.json"
-    with open(summary_file, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\n  Summary: {summary_file.name}")
+            # Save grid JSON (same grid for each day)
+            grid_file = PROC_DIR / f"grid_{date_compact}_d{int(actual_depth)}m.json"
+            with open(grid_file, "w") as f:
+                json.dump(grid_records, f)
 
-    print(f"\n=== Done. {len(valid_depths)} depth(s) processed. ===")
+            # Match ARGO observations for this day
+            obs_file = PROC_DIR / f"obs_{date_compact}_d{int(actual_depth)}m.json"
+            if day_argo:
+                matched = match_obs_to_grid_detailed(day_argo, grid_records, actual_depth)
+                with open(obs_file, "w") as f:
+                    json.dump(matched, f, indent=2)
+                obs_count = len(matched)
+            else:
+                with open(obs_file, "w") as f:
+                    json.dump([], f)
+                obs_count = 0
+
+            summary["depths_processed"].append({
+                "depth_m": int(actual_depth),
+                "grid_points": len(grid_records),
+                "matched_obs": obs_count,
+                "grid_file": grid_file.name,
+                "obs_file": obs_file.name,
+            })
+
+        # Save summary for this day
+        summary_file = PROC_DIR / f"summary_{date_compact}.json"
+        with open(summary_file, "w") as f:
+            json.dump(summary, f, indent=2)
+        all_summaries.append(summary)
+        print(f"  Summary: {summary_file.name} ({sum(d['matched_obs'] for d in summary['depths_processed'])} total obs)")
+
+    print(f"\n=== Done. {len(process_dates)} day(s) × {len(valid_depths)} depth(s) processed. ===")
     print(f"    Output: {PROC_DIR}")
 
 
@@ -348,6 +361,8 @@ def main():
                         metavar=("MIN", "MAX"), help="Latitude range")
     parser.add_argument("--lon-range", type=float, nargs=2, default=list(DEFAULT_LON),
                         metavar=("MIN", "MAX"), help="Longitude range")
+    parser.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                        help="Number of days to process (default: 7)")
     args = parser.parse_args()
 
     process(
@@ -355,6 +370,7 @@ def main():
         depths=args.depths,
         lat_range=tuple(args.lat_range),
         lon_range=tuple(args.lon_range),
+        num_days=args.days,
     )
 
 
