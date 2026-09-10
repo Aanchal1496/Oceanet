@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { getFloatHistory } from '../services/api'
+import { ErrorState, LoadingState, PageHeader, StatusBadge } from '../components/ui'
 
 export default function FloatDetail() {
   const { floatId } = useParams()
@@ -17,20 +18,14 @@ export default function FloatDetail() {
   }, [floatId])
 
   if (loading) return (
-    <div className="min-h-screen bg-background flex items-center justify-center">
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-8 h-8 border-3 border-outline-variant border-t-primary rounded-full animate-spin" />
-        <span className="text-sm text-primary font-mono">Loading float data...</span>
-      </div>
+    <div className="page-container">
+      <LoadingState label="Loading float profile" />
     </div>
   )
 
   if (error) return (
-    <div className="min-h-screen bg-background flex items-center justify-center">
-      <div className="text-center">
-        <p className="text-error text-sm mb-4">Error: {error}</p>
-        <button onClick={() => navigate('/console')} className="px-4 py-2 bg-primary text-on-primary rounded text-sm cursor-pointer">Back to Console</button>
-      </div>
+    <div className="page-container">
+      <ErrorState title="Float profile unavailable" message={error} onRetry={() => window.location.reload()} />
     </div>
   )
 
@@ -45,34 +40,24 @@ export default function FloatDetail() {
   const maxDelta = obs.length ? Math.max(...obs.map(o => Math.abs(o.delta || 0))) : 0
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* Header */}
-      <div className="w-full bg-surface-container-lowest border-b border-outline-variant/30 px-6 py-4 shadow-md">
-        <div className="flex items-center justify-between max-w-6xl mx-auto">
-          <div className="flex items-center gap-4">
-            <button onClick={() => navigate('/console')} className="text-on-surface-variant hover:text-on-surface p-1.5 rounded hover:bg-surface-container-high transition-colors cursor-pointer">
-              <span className="material-symbols-outlined text-xl">arrow_back</span>
+    <div className="page-container">
+      <PageHeader
+        eyebrow="Argo observation profile"
+        title={`Float ${data.id}`}
+        description={`${data.lat?.toFixed(3)}°, ${data.lon?.toFixed(3)}° · ${data.record_count} records · ${data.first_seen} to ${data.last_seen}`}
+        actions={(
+          <>
+            <StatusBadge tone={meanDelta < .5 ? 'success' : meanDelta < 1.5 ? 'warning' : 'danger'}>
+              Mean |ΔT| {meanDelta.toFixed(2)}°C
+            </StatusBadge>
+            <button type="button" onClick={() => navigate('/console')} className="button button--secondary button--compact">
+              <span className="material-symbols-outlined" aria-hidden="true">arrow_back</span>
+              Back to console
             </button>
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <span className="px-2 py-0.5 bg-primary/10 text-primary text-[11px] rounded uppercase tracking-wider font-mono font-semibold">Float Profile</span>
-                <span className="text-on-surface-variant text-[11px] font-mono">•</span>
-                <span className="text-on-surface-variant text-[11px] font-mono">{data.first_seen} → {data.last_seen}</span>
-              </div>
-              <h1 className="text-xl font-bold text-on-surface" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
-                Argo Float #{data.id}
-              </h1>
-            </div>
-          </div>
-          <div className="flex items-center gap-3 text-[11px] font-mono text-on-surface-variant">
-            <span>{data.lat?.toFixed(3)}°N, {data.lon?.toFixed(3)}°E</span>
-            <span>•</span>
-            <span>{data.record_count} records</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="max-w-6xl mx-auto p-6 space-y-6">
+          </>
+        )}
+      />
+      <div className="space-y-6">
         {/* KPI Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <KPICard label="Mean ΔT (Model-Obs)" value={`${meanDelta.toFixed(2)}°C`} color="primary" status={meanDelta < 0.5 ? 'Good' : meanDelta < 1.5 ? 'Moderate' : 'High'} />
@@ -115,7 +100,11 @@ export default function FloatDetail() {
                     function drawLine(arr, color) {
                       if (!arr.length) return
                       ctx.beginPath()
-                      arr.forEach((v, i) => { const [x, y] = toXY(i, v); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) })
+                      arr.forEach((v, i) => {
+                        const [x, y] = toXY(i, v)
+                        if (i === 0) ctx.moveTo(x, y)
+                        else ctx.lineTo(x, y)
+                      })
                       ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke()
                       arr.forEach((v, i) => { const [x, y] = toXY(i, v); ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill() })
                     }
@@ -177,11 +166,12 @@ export default function FloatDetail() {
 }
 
 function KPICard({ label, value, color, status }) {
+  const colorClass = color === 'secondary' ? 'text-secondary' : 'text-primary'
   return (
     <div className="bg-surface-container p-4 rounded border border-outline-variant/20 shadow-sm">
       <div className="text-[11px] font-mono text-on-surface-variant mb-2 uppercase">{label}</div>
       <div className="flex items-baseline gap-2">
-        <span className={`text-2xl font-bold font-mono text-${color}`}>{value}</span>
+        <span className={`text-2xl font-bold font-mono ${colorClass}`}>{value}</span>
       </div>
       <div className="mt-2 pt-2 border-t border-outline-variant/20 text-[11px] text-on-surface-variant font-mono">{status}</div>
     </div>

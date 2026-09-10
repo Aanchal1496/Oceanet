@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getFloats, getDates } from '../services/api'
+import { ErrorState, LoadingState, PageHeader, StatusBadge } from '../components/ui'
 
 export default function ComparisonReport() {
   const navigate = useNavigate()
@@ -26,13 +27,7 @@ export default function ComparisonReport() {
   }, [selectedDay])
 
   const allObs = floats.flatMap(f => (f.observations || []).map(o => ({ ...o, float_id: f.id, float_lat: f.lat, float_lon: f.lon })))
-  const filteredObs = allObs.filter(o => {
-    if (filter && !o.float_id.toLowerCase().includes(filter.toLowerCase())) return false
-    return true
-  })
-
   // Compute stats
-  const meanDelta = allObs.length ? allObs.reduce((s, o) => s + Math.abs(o.delta || 0), 0) / allObs.length : 0
   const rmse = allObs.length ? Math.sqrt(allObs.reduce((s, o) => s + (o.delta || 0) ** 2, 0) / allObs.length) : 0
   const maxDelta = allObs.length ? Math.max(...allObs.map(o => Math.abs(o.delta || 0))) : 0
   const passCount = allObs.filter(o => Math.abs(o.delta || 0) < 0.5).length
@@ -52,64 +47,47 @@ export default function ComparisonReport() {
   const maxDepthRmse = Math.max(...depthTiers.map(d => d.rmse), 0.1)
 
   if (loading) return (
-    <div className="min-h-screen bg-background flex items-center justify-center">
-      <div className="flex flex-col items-center gap-3">
-        <div className="w-8 h-8 border-3 border-outline-variant border-t-primary rounded-full animate-spin" />
-        <span className="text-sm text-primary font-mono">Loading report data...</span>
-      </div>
+    <div className="page-container">
+      <LoadingState label="Loading validation report" />
     </div>
   )
 
   if (error) return (
-    <div className="min-h-screen bg-background flex items-center justify-center">
-      <div className="text-center">
-        <p className="text-error text-sm mb-4">Error: {error}</p>
-        <button onClick={() => navigate('/console')} className="px-4 py-2 bg-primary text-on-primary rounded text-sm cursor-pointer">Back to Console</button>
-      </div>
+    <div className="page-container">
+      <ErrorState title="Validation data unavailable" message={error} onRetry={() => window.location.reload()} />
     </div>
   )
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* Header */}
-      <div className="w-full bg-surface-container-lowest border-b border-outline-variant/30 px-6 py-4 shadow-md">
-        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 max-w-7xl mx-auto">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="px-2 py-0.5 bg-primary/10 text-primary text-[11px] rounded uppercase tracking-wider font-mono font-semibold">Operational Validation Report</span>
-              <span className="text-on-surface-variant text-[11px] font-mono flex items-center gap-1">
-                <span className="material-symbols-outlined text-[14px] text-primary">verified</span>
-                {dates[selectedDay - 1] || 'Latest'}
-              </span>
-            </div>
-            <h1 className="text-xl font-bold text-on-surface tracking-wide" style={{ fontFamily: "'Space Grotesk', sans-serif" }}>
-              Model Accuracy & In-Situ Benchmark
-            </h1>
-            <p className="text-sm text-on-surface-variant mt-1 max-w-3xl">
-              Evaluation of GODAS numerical ocean models against active Argo float observations across the Indian Ocean basin.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
+    <div className="page-container">
+      <PageHeader
+        eyebrow="Operational validation report"
+        title="Model accuracy and in-situ benchmark"
+        description="Evaluation of GODAS numerical ocean output against active Argo float observations across the Indian Ocean basin."
+        actions={(
+          <>
+            <StatusBadge tone="success">{dates[selectedDay - 1] || 'Latest model day'}</StatusBadge>
             <select
+              aria-label="Report model day"
               value={selectedDay}
               onChange={e => setSelectedDay(parseInt(e.target.value))}
               className="h-8 px-3 bg-surface-container border border-outline-variant/30 hover:border-primary text-on-surface text-[12px] rounded transition-colors cursor-pointer focus:outline-none focus:bg-surface-bright"
             >
               {dates.map((d, i) => <option key={i} value={i + 1}>{d}</option>)}
             </select>
-            <button className="h-8 px-3 bg-surface-container hover:bg-surface-bright text-on-surface text-[12px] rounded transition-colors flex items-center gap-1.5 border border-outline-variant/30 cursor-pointer">
+            <button type="button" className="button button--secondary button--compact" aria-label="Share validation report">
               <span className="material-symbols-outlined text-[16px]">share</span>
               Share
             </button>
-            <button className="h-8 px-3.5 bg-primary text-on-primary text-[12px] rounded transition-colors flex items-center gap-1.5 hover:bg-primary-container cursor-pointer">
+            <button type="button" className="button button--primary button--compact" aria-label="Export report as PDF">
               <span className="material-symbols-outlined text-[16px]">picture_as_pdf</span>
               Export PDF
             </button>
-          </div>
-        </div>
-      </div>
+          </>
+        )}
+      />
 
-      <div className="max-w-7xl mx-auto p-6 space-y-6">
+      <div className="space-y-6">
         {/* KPI Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <KPICard title="Basin Mean RMSE" value={`${rmse.toFixed(2)}°C`} badge="TARGET <0.5°C" badgeColor="primary" icon="check_circle" iconColor="primary" footer={`${(rmse * 100 / 0.5).toFixed(0)}% of target`} />
@@ -311,17 +289,19 @@ export default function ComparisonReport() {
 }
 
 function KPICard({ title, value, badge, badgeColor, icon, iconColor, footer }) {
+  const badgeClasses = badgeColor === 'secondary' ? 'bg-secondary/10 text-secondary' : 'bg-primary/10 text-primary'
+  const iconClasses = iconColor === 'secondary' ? 'text-secondary' : 'text-primary'
   return (
     <div className="bg-surface-container p-4 rounded border border-outline-variant/20 shadow-sm flex flex-col justify-between hover:border-outline-variant/50 transition-colors">
       <div className="flex items-center justify-between text-on-surface-variant mb-2">
         <span className="text-[11px] font-mono uppercase text-on-surface font-semibold">{title}</span>
-        <span className={`px-1.5 py-0.5 bg-${badgeColor}/10 text-${badgeColor} text-[10px] font-bold font-mono rounded`}>{badge}</span>
+        <span className={`px-1.5 py-0.5 text-[10px] font-bold font-mono rounded ${badgeClasses}`}>{badge}</span>
       </div>
       <div className="flex items-baseline gap-2 my-1">
         <span className="text-2xl font-bold font-mono text-on-surface">{value}</span>
       </div>
       <div className="mt-2 pt-2 border-t border-outline-variant/20 flex items-center justify-between text-[11px] font-mono">
-        <span className={`text-${iconColor} flex items-center gap-1 font-medium`}>
+        <span className={`${iconClasses} flex items-center gap-1 font-medium`}>
           <span className="material-symbols-outlined text-[14px]">{icon}</span> {footer}
         </span>
       </div>

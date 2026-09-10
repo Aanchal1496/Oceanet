@@ -169,6 +169,9 @@ export default forwardRef(function CesiumView({
   trajectoryFloatId,
   comparisonMode,
   currents = [],
+  currentSource,
+  currentTimestamp,
+  onInspectCurrent,
 }, ref) {
   const cesiumIonToken = import.meta.env.VITE_CESIUM_ION_TOKEN?.trim()
   const containerRef = useRef(null)
@@ -352,6 +355,9 @@ export default forwardRef(function CesiumView({
             y: movement.endPosition.y,
           })
           viewer.container.style.cursor = 'pointer'
+        } else if (Cesium.defined(picked) && picked.id?.userData?.kind === 'current') {
+          onHoverFloat?.(null, null)
+          viewer.container.style.cursor = 'pointer'
         } else {
           onHoverFloat?.(null, null)
           viewer.container.style.cursor = 'default'
@@ -363,6 +369,8 @@ export default forwardRef(function CesiumView({
         const picked = viewer.scene.pick(click.position)
         if (Cesium.defined(picked) && picked.id?.userData?.id) {
           onSelectFloat?.(picked.id.userData)
+        } else if (Cesium.defined(picked) && picked.id?.userData?.kind === 'current') {
+          onInspectCurrent?.(picked.id.userData)
         }
       }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
 
@@ -407,7 +415,7 @@ export default forwardRef(function CesiumView({
     const Cesium = window.Cesium
     if (!Cesium) return
     updateCurrentVectors(Cesium, viewerRef.current)
-  }, [currents, mapMode, viewerReady])
+  }, [currents, mapMode, viewerReady, currentSource, currentTimestamp])
 
   function updateMarkers(Cesium, viewer, cameraHeight) {
     // Remove old entities
@@ -581,11 +589,15 @@ export default forwardRef(function CesiumView({
       for (let lon = minLon - 1; lon <= maxLon + 1; lon += 2.45) {
         const path = buildStreamline(lon, lat)
         if (path.length < 2) continue
-        const speed = sampleField(lon, lat).speed
+        const field = sampleField(lon, lat)
+        const speed = field.speed
         const [r, g, b] = getColorForValue(speed, 0, maxSpeed, 'currents')
         streamlines.push({
           path,
           speed,
+          lat,
+          lon,
+          direction: (Math.atan2(field.u, field.v) * 180 / Math.PI + 360) % 360,
           phase: (seedIndex * 0.173) % 1,
           color: Cesium.Color.fromBytes(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 220),
         })
@@ -616,6 +628,15 @@ export default forwardRef(function CesiumView({
             color: streamline.color.withAlpha(0.58),
           }),
           clampToGround: true,
+        },
+        userData: {
+          kind: 'current',
+          lat: streamline.lat,
+          lon: streamline.lon,
+          speed: streamline.speed,
+          direction: streamline.direction,
+          source: currentSource || 'unavailable',
+          timestamp: currentTimestamp || null,
         },
       })
       currentEntitiesRef.current.push(lineEntity)
@@ -682,6 +703,8 @@ export default forwardRef(function CesiumView({
   return (
     <div
       ref={containerRef}
+      data-testid="earth-map"
+      aria-label="Interactive Indian Ocean globe"
       style={{
         width: '100%',
         height: '100%',

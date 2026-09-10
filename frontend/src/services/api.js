@@ -33,3 +33,7 @@ export async function getFloatHistory(floatId) {
 export async function getHealth() {
   return fetchJSON('/health');
 }
+
+export async function getDataStatus() {
+  return fetchJSON(`${API_BASE}/data-status`);
+}
