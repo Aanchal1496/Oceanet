@@ -23,7 +23,7 @@ export default function RegionResults({ regions, onFlyTo, onClose }) {
 
       {/* Region list */}
       <div className="overflow-y-auto flex-1 divide-y divide-outline-variant/15">
-        {regions.map((region, i) => (
+        {regions.map((region) => (
           <div
             key={region.key}
             className="px-4 py-3 hover:bg-surface-container-high transition-colors cursor-pointer group"

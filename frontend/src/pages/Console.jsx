@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
-import { getDates, getDepths, getGrid, getFloats, getCurrents } from '../services/api'
+import { getDates, getDepths, getGrid, getFloats, getCurrents, getDataStatus } from '../services/api'
 import CesiumView from '../components/CesiumView'
 import FloatDetailsPanel from '../components/FloatDetailsPanel'
 import MapLegend from '../components/MapLegend'
@@ -63,6 +63,7 @@ export default function Console() {
   const [selectedFloat, setSelectedFloat] = useState(null)
   const [viewMode, setViewMode] = useState('layers')
   const [presMode, setPresMode] = useState(false)
+  const [layerControlsOpen, setLayerControlsOpen] = useState(true)
   const playRef = useRef(null)
   const activeDepthIdxRef = useRef(0)
 
@@ -77,6 +78,8 @@ export default function Console() {
   const [comparisonMode, setComparisonMode] = useState('absolute')
   const [cesiumFloatData, setCesiumFloatData] = useState(null)
   const [currents, setCurrents] = useState([])
+  const [currentMeta, setCurrentMeta] = useState({ source: null, date: null, units: null, error: null })
+  const [selectedCurrent, setSelectedCurrent] = useState(null)
   const [gridPointCount, setGridPointCount] = useState(0)
   const [foundRegions, setFoundRegions] = useState(null)
   const [lastUpdated, setLastUpdated] = useState(null)
@@ -107,9 +110,7 @@ export default function Console() {
     let cancelled = false
     async function loadStatus() {
       try {
-        const resp = await fetch('/api/data-status')
-        if (!resp.ok) throw new Error('bad status')
-        const data = await resp.json()
+        const data = await getDataStatus()
         if (cancelled) return
         setLastUpdated(data.last_updated)
         setDataStatus(data.status)
@@ -155,7 +156,7 @@ export default function Console() {
     T.camera = camera
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
-    renderer.setPixelRatio(window.devicePixelRatio)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.setSize(holder.clientWidth, holder.clientHeight)
     renderer.setClearColor(0x050b14)
     holder.appendChild(renderer.domElement)
@@ -454,9 +455,10 @@ export default function Console() {
         if (cancelled) return
         T.allFloatData = floatData
         setCesiumFloatData(floatData)
-        const currentsResp = await getCurrents(1)
+        const currentsResp = await getCurrents(1).catch(currentError => ({ currents: [], source: null, date: datesResp.dates[0], units: 'm/s', error: currentError.message }))
         if (cancelled) return
         setCurrents(currentsResp.currents || [])
+        setCurrentMeta({ source: currentsResp.source, date: currentsResp.date, units: currentsResp.units, error: currentsResp.error || null })
         setDisclaimer(`Live data from GODAS model + ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''} — Indian Ocean, ${dataStatus === 'stale' ? 'Data may be stale' : dataStatus === 'never_updated' ? 'No data update yet' : 'Latest available data'}.`)
 
         initDepthMeshes(depthResp.depths.length)
@@ -488,6 +490,9 @@ export default function Console() {
   useEffect(() => {
     if (playing) {
       playRef.current = setInterval(() => {
+        // Advancing the day triggers API refetches; do not run this while the
+        // tab is hidden or the console would poll in the background.
+        if (document.hidden) return
         setActiveDay(d => d >= totalDays ? 1 : d + 1)
       }, 900)
     } else {
@@ -519,9 +524,11 @@ export default function Console() {
         if (cancelled) return
         T.allFloatData = floatData
         setCesiumFloatData(floatData)
-        const currentsResp = await getCurrents(activeDay)
+        const currentsResp = await getCurrents(activeDay).catch(currentError => ({ currents: [], source: null, date: null, units: 'm/s', error: currentError.message }))
         if (cancelled) return
         setCurrents(currentsResp.currents || [])
+        setCurrentMeta({ source: currentsResp.source, date: currentsResp.date, units: currentsResp.units, error: currentsResp.error || null })
+        setSelectedCurrent(null)
 
         buildFloatMarkers()
         updateGridColors()
@@ -574,6 +581,7 @@ export default function Console() {
   const handleMapModeChange = useCallback((mode) => {
     if (!['density', 'temperature', 'salinity', 'currents'].includes(mode)) return
     setMapMode(mode)
+    setSelectedCurrent(null)
     setAnomalyMode('all')
     if (['temperature', 'salinity'].includes(mode)) {
       setFilters(prev => ({ ...prev, variable: mode }))
@@ -604,7 +612,7 @@ export default function Console() {
   const floatCount = cesiumFloatData?.float_count || 0
 
   return (
-    <div className="min-h-dvh w-screen bg-background overflow-hidden relative select-none">
+    <div className="h-full min-h-0 w-full bg-background overflow-hidden relative select-none" data-testid="ocean-console">
       {/* Loading overlay */}
       {loading && (
         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background/65 backdrop-blur-sm">
@@ -615,14 +623,15 @@ export default function Console() {
 
       {/* Error banner */}
       {error && (
-        <div className="absolute top-3 left-3 right-3 z-40 bg-error-container/20 border border-error/30 text-error px-4 py-2 rounded-lg text-sm font-mono">
-          Error: {error}
+        <div className="absolute top-3 left-3 right-3 z-40 bg-error-container/90 border border-error/35 text-on-error-container px-4 py-2.5 rounded-lg text-xs font-mono flex items-center justify-between gap-3" role="alert">
+          <span>Ocean sources unavailable: {error}</span>
+          <button type="button" className="px-2.5 py-1 rounded bg-error text-on-error font-semibold" onClick={() => window.location.reload()}>Retry</button>
         </div>
       )}
 
       {/* Top HUD strip */}
       {!presMode && (
-      <div className="absolute top-3 left-3 right-3 z-30 flex items-start justify-between gap-3 pointer-events-none">
+      <div className="console-hud absolute top-3 left-3 right-3 z-30 flex items-start justify-between gap-3 pointer-events-none">
         <div className="flex items-center gap-3 pointer-events-auto bg-surface-container-lowest/78 backdrop-blur-xl px-3 py-2 rounded-xl border border-outline-variant/20 shadow-lg shadow-black/15">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-primary" />
@@ -645,7 +654,7 @@ export default function Console() {
           )}
         </div>
 
-        <div className="pointer-events-auto flex items-center bg-surface-container-lowest/80 backdrop-blur-md p-1 rounded-lg border border-outline-variant/20 shadow-md">
+        <div className="console-view-toggle pointer-events-auto flex items-center bg-surface-container-lowest/80 backdrop-blur-md p-1 rounded-lg border border-outline-variant/20 shadow-md">
           <button
             onClick={() => setViewMode('layers')}
             className={`px-3 py-1.5 text-[12px] font-semibold rounded transition-colors flex items-center gap-1.5 cursor-pointer ${
@@ -710,8 +719,9 @@ export default function Console() {
       {/* 3D Layer View (Three.js) — always mounted, hidden when in earth mode */}
       <div
         ref={holderRef}
-        className={`absolute inset-0 z-0 cursor-grab active:cursor-grabbing ${viewMode === 'layers' ? 'md:left-64 md:right-0' : ''}`}
+        className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing"
         style={{ display: viewMode === 'layers' ? 'block' : 'none' }}
+        data-testid="layer-map"
       />
 
       {/* 3D Earth View (Cesium) */}
@@ -730,6 +740,9 @@ export default function Console() {
             showTrajectory={showTrajectory}
             trajectoryFloatId={trajectoryFloatId}
             comparisonMode={comparisonMode}
+            currentSource={currentMeta.source}
+            currentTimestamp={currentMeta.date}
+            onInspectCurrent={setSelectedCurrent}
           />
         </div>
       )}
@@ -737,6 +750,35 @@ export default function Console() {
       {/* Map Mode Selector (earth view only, non-presentation) */}
       {!presMode && viewMode === 'earth' && (
         <MapModeSelector activeMode={mapMode} onModeChange={handleMapModeChange} />
+      )}
+
+      {!presMode && viewMode === 'earth' && mapMode === 'currents' && (
+        <div className="current-inspector" aria-live="polite" data-testid="current-inspector">
+          <div className="current-inspector__header">
+            <div>
+              <span>Current layer</span>
+              <strong>{currentMeta.source === 'synthetic-demo' ? 'Model demo field' : currentMeta.source || 'Source unavailable'}</strong>
+            </div>
+            {selectedCurrent && <button type="button" onClick={() => setSelectedCurrent(null)} aria-label="Clear selected current"><span className="material-symbols-outlined">close</span></button>}
+          </div>
+          {currentMeta.error ? (
+            <div className="current-inspector__error">
+              <span className="material-symbols-outlined" aria-hidden="true">cloud_off</span>
+              <p>Current vectors are unavailable. Other ocean layers remain operational.</p>
+              <button type="button" onClick={() => window.location.reload()}>Retry source</button>
+            </div>
+          ) : selectedCurrent ? (
+            <dl>
+              <div><dt>Speed</dt><dd>{selectedCurrent.speed.toFixed(2)} {currentMeta.units || 'm/s'}</dd></div>
+              <div><dt>Direction</dt><dd>{selectedCurrent.direction.toFixed(0)}°</dd></div>
+              <div><dt>Location</dt><dd>{selectedCurrent.lat.toFixed(2)}°, {selectedCurrent.lon.toFixed(2)}°</dd></div>
+              <div><dt>Model date</dt><dd>{selectedCurrent.timestamp || 'Unavailable'}</dd></div>
+            </dl>
+          ) : (
+            <p>Select a streamline to inspect direction, speed, location and model date.</p>
+          )}
+          <small>Visualization is derived from the API response and is not a live observed current.</small>
+        </div>
       )}
 
       {/* Stats Bar (earth view, non-presentation) */}
@@ -759,8 +801,8 @@ export default function Console() {
       )}
 
       {/* Layer controls are shown only for the 3D layer view. */}
-      {!presMode && viewMode === 'layers' && (
-        <div className="absolute top-[4.75rem] left-4 z-20 w-56 max-w-[calc(100vw-2rem)] pointer-events-auto">
+      {!presMode && viewMode === 'layers' && layerControlsOpen && (
+        <div className="layer-controls absolute top-[4.75rem] left-4 z-20 w-56 max-w-[calc(100vw-2rem)] pointer-events-auto">
           <div className="bg-surface-container-lowest/82 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 overflow-hidden">
             <div className="px-4 pt-3.5 pb-3 border-b border-outline-variant/15">
               <div className="flex items-start justify-between gap-3">
@@ -768,15 +810,17 @@ export default function Console() {
                   <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-primary/80">Layer controls</span>
                   <h2 className="mt-1 text-[14px] font-semibold text-on-surface">Explore the water column</h2>
                 </div>
-                <span className="material-symbols-outlined text-[18px] text-on-surface-variant/70">tune</span>
+                <button type="button" className="layer-controls__close" onClick={() => setLayerControlsOpen(false)} aria-label="Hide layer controls">
+                  <span className="material-symbols-outlined text-[18px]">close</span>
+                </button>
               </div>
-              <p className="mt-1.5 text-[10px] leading-relaxed text-on-surface-variant/70">Choose a field and depth. The surface updates from the loaded GODAS grid.</p>
+              <p className="layer-controls__description mt-1.5 text-[10px] leading-relaxed text-on-surface-variant/70">Choose a field and depth. The surface updates from the loaded GODAS grid.</p>
             </div>
 
             <div className="p-3 space-y-4">
               <div>
                 <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Field</span>
-                <div className="mt-2 grid grid-cols-2 gap-1.5">
+                <div className="layer-controls__depth-grid mt-2 grid grid-cols-2 gap-1.5">
                   <button aria-pressed="true" className="py-2 px-2 bg-primary/12 border border-primary/70 text-primary text-[11px] font-semibold rounded-lg transition-colors">
                     Temperature
                   </button>
@@ -841,6 +885,13 @@ export default function Console() {
         </div>
       )}
 
+      {!presMode && viewMode === 'layers' && !layerControlsOpen && (
+        <button type="button" className="layer-controls-trigger" onClick={() => setLayerControlsOpen(true)}>
+          <span className="material-symbols-outlined" aria-hidden="true">tune</span>
+          Layer controls
+        </button>
+      )}
+
       {/* Layer telemetry keeps the API-backed field readable while exploring depth. */}
       {!presMode && viewMode === 'layers' && (
         <div className="hidden md:block absolute right-4 bottom-5 z-20 w-56 max-w-[calc(100vw-2rem)] bg-surface-container-lowest/78 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 p-3.5 pointer-events-none">
@@ -889,7 +940,7 @@ export default function Console() {
 
       {/* Disclaimer banner */}
       {!presMode && (
-      <div className="absolute top-14 right-3 z-20 max-w-xs">
+      <div className="console-disclaimer absolute top-14 right-3 z-20 max-w-xs">
         <div className="bg-surface-container-lowest/80 backdrop-blur-md px-3 py-2 rounded-lg border border-outline-variant/20 shadow-md text-[11px] text-on-surface-variant font-mono leading-relaxed">
           {disclaimer}
         </div>
