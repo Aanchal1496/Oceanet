@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
-import { getDates, getDepths, getGrid, getFloats } from '../services/api'
+import { getDates, getDepths, getGrid, getFloats, getCurrents } from '../services/api'
 import CesiumView from '../components/CesiumView'
 import LeftFilterPanel from '../components/LeftFilterPanel'
 import FloatDetailsPanel from '../components/FloatDetailsPanel'
@@ -61,7 +61,9 @@ export default function Console() {
 
   // New state for research UX
   const [filters, setFilters] = useState(DEFAULT_FILTERS)
-  const [filterCollapsed, setFilterCollapsed] = useState(false)
+  const [filterCollapsed, setFilterCollapsed] = useState(() => (
+    typeof window !== 'undefined' && window.innerWidth < 768
+  ))
   const [mapMode, setMapMode] = useState('floats')
   const [anomalyMode, setAnomalyMode] = useState('all')
   const [hoveredFloat, setHoveredFloat] = useState(null)
@@ -70,6 +72,8 @@ export default function Console() {
   const [trajectoryFloatId, setTrajectoryFloatId] = useState(null)
   const [comparisonMode, setComparisonMode] = useState('absolute')
   const [cesiumFloatData, setCesiumFloatData] = useState(null)
+  const [currents, setCurrents] = useState([])
+  const [gridPointCount, setGridPointCount] = useState(0)
   const [foundRegions, setFoundRegions] = useState(null)
   const cesiumRef = useRef(null)
 
@@ -228,7 +232,7 @@ export default function Console() {
       if (holder.contains(renderer.domElement)) holder.removeChild(renderer.domElement)
       T.scene = null
     }
-  }, [viewMode])
+  }, [])
 
   function buildGridGeometry() {
     const positions = new Float32Array(N * M * 3)
@@ -264,8 +268,16 @@ export default function Console() {
     if (!pts || !T.gridLats.length || !T.gridLons.length) return 0
     const lat = T.gridLats[Math.round(j / (M - 1) * (T.gridLats.length - 1))]
     const lon = T.gridLons[Math.round(i / (N - 1) * (T.gridLons.length - 1))]
-    for (const pt of pts) if (pt.lat === lat && pt.lon === lon) return pt.value
-    return 0
+    let nearest = pts[0]
+    let nearestDistance = Infinity
+    for (const pt of pts) {
+      const distance = Math.abs(pt.lat - lat) + Math.abs(pt.lon - lon)
+      if (distance < nearestDistance) {
+        nearest = pt
+        nearestDistance = distance
+      }
+    }
+    return nearest?.value ?? 0
   }
 
   function computeColorRange() {
@@ -288,13 +300,17 @@ export default function Console() {
       const geo = T.depthGeos[di]
       if (!geo) continue
       const colors = geo.attributes.color.array
+      const positions = geo.attributes.position.array
       for (let j = 0; j < M; j++) for (let i = 0; i < N; i++) {
         const idx = j * N + i
         const v = getValueAt(i, j, di)
-        const [r, g, b] = colorRamp((v - T.globalMin) / range)
+        const normalized = Math.max(0, Math.min(1, (v - T.globalMin) / range))
+        const [r, g, b] = colorRamp(normalized)
         colors[idx * 3] = r; colors[idx * 3 + 1] = g; colors[idx * 3 + 2] = b
+        positions[idx * 3 + 1] = (normalized - 0.5) * 1.35
       }
       geo.attributes.color.needsUpdate = true
+      geo.attributes.position.needsUpdate = true
       T.depthMeshes[di].material.opacity = di === currentIdx ? 0.95 : 0.16
       T.depthWireframes[di].material.opacity = di === currentIdx ? 0.4 : 0.12
     }
@@ -386,12 +402,16 @@ export default function Console() {
           T.gridCache.set(d.depth_index, grid)
         }
         buildLatLonMaps()
+        setGridPointCount([...T.gridCache.values()].reduce((sum, points) => sum + points.length, 0))
 
         setLoadingMsg('Fetching float observations...')
         const floatData = await getFloats(1)
         if (cancelled) return
         T.allFloatData = floatData
         setCesiumFloatData(floatData)
+        const currentsResp = await getCurrents(1)
+        if (cancelled) return
+        setCurrents(currentsResp.currents || [])
         setDisclaimer(`Live data from GODAS model + ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''} — Indian Ocean, July 2026.`)
 
         initDepthMeshes(depthResp.depths.length)
@@ -447,12 +467,16 @@ export default function Console() {
           T.gridCache.set(d.depth_index, grid)
         }
         buildLatLonMaps()
+        setGridPointCount([...T.gridCache.values()].reduce((sum, points) => sum + points.length, 0))
         computeColorRange()
 
         const floatData = await getFloats(activeDay)
         if (cancelled) return
         T.allFloatData = floatData
         setCesiumFloatData(floatData)
+        const currentsResp = await getCurrents(activeDay)
+        if (cancelled) return
+        setCurrents(currentsResp.currents || [])
 
         buildFloatMarkers()
         updateGridColors()
@@ -508,6 +532,24 @@ export default function Console() {
     setFilters(prev => ({ ...prev, anomalyMode: mode }))
   }, [])
 
+  const handleMapModeChange = useCallback((mode) => {
+    setMapMode(mode)
+    if (mode === 'anomaly') setAnomalyMode('anomalies')
+    if (mode !== 'anomaly' && anomalyMode === 'anomalies') setAnomalyMode('all')
+    if (['temperature', 'salinity', 'oxygen', 'pressure'].includes(mode)) {
+      setFilters(prev => ({ ...prev, variable: mode }))
+    }
+  }, [anomalyMode])
+
+  const handleFiltersChange = useCallback((nextFilters) => {
+    setFilters(nextFilters)
+    const nextMode = nextFilters.variable === 'delta' ? 'anomaly' : nextFilters.variable
+    if (['temperature', 'salinity', 'oxygen', 'pressure', 'anomaly'].includes(nextMode)) {
+      setMapMode(nextMode)
+    }
+    setAnomalyMode(nextFilters.anomalyMode)
+  }, [])
+
   // Handler for finding interesting regions
   const handleFindRegions = useCallback((regions) => {
     setFoundRegions(regions)
@@ -523,10 +565,9 @@ export default function Console() {
   const depthLabels = ['Surface', 'Mid column', 'Deep', 'Deeper', 'Abyssal']
 
   // Compute legend variable from mapMode
-  const legendVariable = mapMode === 'anomaly' ? 'anomaly'
-    : mapMode === 'salinity' ? 'salinity'
-    : comparisonMode === 'difference' ? 'delta'
-    : 'temperature'
+  const legendVariable = comparisonMode === 'difference' ? 'delta'
+    : mapMode === 'density' ? 'temperature'
+    : mapMode
 
   // Float count from CesiumView data
   const floatCount = cesiumFloatData?.float_count || 0
@@ -631,16 +672,17 @@ export default function Console() {
       {/* 3D Layer View (Three.js) — always mounted, hidden when in earth mode */}
       <div
         ref={holderRef}
-        className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing"
+        className={`absolute inset-0 z-0 cursor-grab active:cursor-grabbing ${viewMode === 'layers' ? 'md:left-64 md:right-0' : ''}`}
         style={{ display: viewMode === 'layers' ? 'block' : 'none' }}
       />
 
       {/* 3D Earth View (Cesium) */}
       {viewMode === 'earth' && (
-        <div className="absolute inset-0 z-0" style={{ width: '100%', height: '100%' }}>
+        <div className="absolute inset-0 z-0 md:left-64" style={{ height: '100%' }}>
           <CesiumView
             ref={cesiumRef}
             floatData={cesiumFloatData}
+            currents={currents}
             filters={filters}
             mapMode={mapMode}
             anomalyMode={anomalyMode}
@@ -654,11 +696,11 @@ export default function Console() {
         </div>
       )}
 
-      {/* Left Filter Panel (collapsible, both modes) */}
-      {!presMode && (
+      {/* Left Filter Panel belongs to the Earth map; Layer View has its own depth rail. */}
+      {!presMode && viewMode === 'earth' && (
         <LeftFilterPanel
           filters={filters}
-          onFilterChange={setFilters}
+          onFilterChange={handleFiltersChange}
           collapsed={filterCollapsed}
           onToggleCollapse={() => setFilterCollapsed(!filterCollapsed)}
           availableDepths={availableDepths}
@@ -667,7 +709,7 @@ export default function Console() {
 
       {/* Map Mode Selector (earth view only, non-presentation) */}
       {!presMode && viewMode === 'earth' && (
-        <MapModeSelector activeMode={mapMode} onModeChange={setMapMode} />
+        <MapModeSelector activeMode={mapMode} onModeChange={handleMapModeChange} />
       )}
 
       {/* Stats Bar (earth view, non-presentation) */}
@@ -691,14 +733,17 @@ export default function Console() {
 
       {/* Left rail for Layer view controls */}
       {!presMode && viewMode === 'layers' && (
-      <div className="absolute top-14 left-3 z-20 w-56 flex flex-col gap-3 pointer-events-auto">
+      <div className="absolute top-14 left-3 z-20 w-64 max-w-[calc(100vw-1.5rem)] max-h-[calc(100vh-5rem)] overflow-y-auto pr-1 flex flex-col gap-3 pointer-events-auto">
         <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
           <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Variable</span>
           <div className="flex gap-1.5">
             <button className="flex-1 py-1.5 px-2 bg-primary/10 border border-primary text-primary text-[12px] font-semibold rounded transition-colors">
               Temperature
             </button>
-            <button className="flex-1 py-1.5 px-2 bg-transparent border border-outline-variant/30 text-on-surface-variant text-[12px] font-semibold rounded opacity-40 cursor-not-allowed">
+            <button
+              onClick={() => { setMapMode('currents'); setViewMode('earth') }}
+              className="flex-1 py-1.5 px-2 bg-transparent border border-outline-variant/30 text-on-surface-variant text-[12px] font-semibold rounded hover:border-primary hover:text-primary transition-colors cursor-pointer"
+            >
               Currents
             </button>
           </div>
@@ -759,6 +804,22 @@ export default function Console() {
       </div>
       )}
 
+      {/* Layer telemetry keeps the API-backed field readable while exploring depth. */}
+      {!presMode && viewMode === 'layers' && (
+        <div className="absolute right-3 bottom-16 z-20 w-64 max-w-[calc(100vw-1.5rem)] bg-surface-container-lowest/85 backdrop-blur-md rounded-lg border border-outline-variant/20 shadow-md p-3 pointer-events-none">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[10px] font-mono text-on-surface-variant/70 uppercase tracking-widest">Live field</span>
+            <span className="text-[10px] font-mono text-primary">GODAS + ARGO</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">GRID POINTS</span><span className="text-on-surface">{gridPointCount.toLocaleString()}</span></div>
+            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">FLOATS</span><span className="text-primary">{floatCount.toLocaleString()}</span></div>
+            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">LAYERS</span><span className="text-on-surface">{availableDepths.length}</span></div>
+            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">DAY</span><span className="text-on-surface">{activeDay} / {totalDays}</span></div>
+          </div>
+        </div>
+      )}
+
       {/* Map Legend */}
       {!presMode && viewMode === 'earth' && (
         <MapLegend variable={legendVariable} />
@@ -780,7 +841,6 @@ export default function Console() {
           float={selectedFloat}
           onClose={() => {
             setSelectedFloat(null)
-            setFloatHistory(null)
             setShowTrajectory(false)
             setTrajectoryFloatId(null)
             threeRef.current.selectedFloatMesh = null

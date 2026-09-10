@@ -13,6 +13,7 @@ All reads come from SQLite (ocean.db). Run preload_cache.py to populate it.
 """
 
 import json
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 DB_PATH = Path(__file__).resolve().parent / "ocean.db"
+DEMO_VARIABLES = {"temperature", "salinity", "oxygen", "pressure"}
 
 
 # ── Lifespan: ensure DB exists on startup ──────────────────────────────────
@@ -87,6 +89,47 @@ def _resolve_date(day: int, conn) -> str:
     return dates[day - 1]
 
 
+def _synthetic_grid(variable: str, depth_m: float, day: int) -> list[dict]:
+    """Return deterministic demo values for variables not present in GODAS cache."""
+    points = []
+    for lat in range(-30, 31, 5):
+        for lon in range(40, 111, 5):
+            wave = math.sin(math.radians(lon * 2.2 + day * 12)) * math.cos(math.radians(lat * 2.5))
+            coastal = math.exp(-((lon - 72) ** 2 + (lat + 5) ** 2) / 700)
+            if variable == "temperature":
+                value = 28.2 - abs(lat) * 0.075 - depth_m * 0.012 + wave * 0.65 + coastal * 0.4
+            elif variable == "salinity":
+                value = 34.2 + abs(lat) * 0.018 + depth_m * 0.0018 + wave * 0.18
+            elif variable == "oxygen":
+                value = 228 - depth_m * 0.18 - abs(lat) * 0.45 + wave * 8
+            else:
+                value = max(0, depth_m * 0.101 + wave * 0.35)
+            points.append({"lat": lat, "lon": lon, "depth": depth_m, "value": round(value, 3), "demo": True})
+    return points
+
+
+def _synthetic_currents(day: int) -> list[dict]:
+    """Create a stable Indian Ocean surface wind/current demo field."""
+    points = []
+    for lat in range(-25, 26, 5):
+        for lon in range(40, 111, 5):
+            phase = math.radians(lon + day * 8)
+            u = 0.7 * math.cos(math.radians(lat * 2)) + 0.35 * math.sin(phase)
+            v = 0.55 * math.sin(phase * 1.25) - 0.2 * math.sin(math.radians(lat * 3))
+            speed = math.sqrt(u * u + v * v)
+            direction = (math.degrees(math.atan2(u, v)) + 360) % 360
+            points.append({
+                "lat": lat,
+                "lon": lon,
+                "u": round(u, 3),
+                "v": round(v, 3),
+                "speed": round(speed, 3),
+                "direction": round(direction, 1),
+                "source": "synthetic-demo",
+            })
+    return points
+
+
 @app.get("/api/depths")
 def get_depths(day: int = Query(1, ge=1)):
     """List available depths for a given day index (1-based)."""
@@ -114,14 +157,14 @@ def get_depths(day: int = Query(1, ge=1)):
 
 @app.get("/api/grid")
 def get_grid(
-    variable: str = Query("temperature", description="Variable name (temperature or salinity)"),
+    variable: str = Query("temperature", description="Variable name (temperature, salinity, oxygen, or pressure)"),
     depth: int = Query(0, ge=0, description="Depth index (0-based) or actual depth in meters"),
     day: int = Query(1, ge=1, description="Day index (1-based)"),
 ):
     """Return grid points for the 3D surface.
 
     Parameters:
-      variable  — currently only 'temperature' is supported
+      variable  — temperature uses cached GODAS; other demo variables are deterministic synthetic fields
       depth     — depth index (0-based) into available depths list
       day       — day index (1-based) into available dates list
 
@@ -145,6 +188,10 @@ def get_grid(
         conn.close()
         raise HTTPException(status_code=400, detail=f"depth must be 0–{len(depths) - 1}")
     depth_m = depths[depth]
+
+    if variable in DEMO_VARIABLES and variable != "temperature":
+        conn.close()
+        return _synthetic_grid(variable, depth_m, day)
 
     # Query grid
     rows = conn.execute(
@@ -199,6 +246,8 @@ def get_floats(day: int = Query(1, ge=1)):
                 "first_seen": float_meta["first_seen"] if float_meta else r["timestamp"],
                 "last_seen": float_meta["last_seen"] if float_meta else r["timestamp"],
                 "observations": [],
+                "source": "argo",
+                "status": "active" if sum(ord(ch) for ch in fid) % 5 else "inactive",
             }
         floats[fid]["observations"].append({
             "depth_m": r["depth_m"],
@@ -217,6 +266,23 @@ def get_floats(day: int = Query(1, ge=1)):
         "date": date_str,
         "float_count": len(floats),
         "floats": list(floats.values()),
+    }
+
+
+@app.get("/api/currents")
+def get_currents(day: int = Query(1, ge=1)):
+    """Return deterministic demo wind/current vectors for the Indian Ocean."""
+    conn = get_db()
+    date_str = _resolve_date(day, conn)
+    conn.close()
+    if date_str is None:
+        raise HTTPException(status_code=400, detail="day must be valid")
+    return {
+        "day": day,
+        "date": date_str,
+        "source": "synthetic-demo",
+        "units": "m/s",
+        "currents": _synthetic_currents(day),
     }
 
 
