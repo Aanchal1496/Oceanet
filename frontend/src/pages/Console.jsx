@@ -30,6 +30,17 @@ function colorRamp(t) {
   return [c[0] / 255, c[1] / 255, c[2] / 255]
 }
 
+function relativeTime(ts) {
+  if (!ts) return 'Never'
+  const minutes = Math.floor((Date.now() - new Date(ts).getTime()) / 60000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes} minutes ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} hours ago`
+  const days = Math.floor(hours / 24)
+  return `${days} days ago`
+}
+
 const DEFAULT_FILTERS = {
   dataSource: { argo: true, godas: true, inSitu: false },
   variable: 'temperature',
@@ -68,6 +79,9 @@ export default function Console() {
   const [currents, setCurrents] = useState([])
   const [gridPointCount, setGridPointCount] = useState(0)
   const [foundRegions, setFoundRegions] = useState(null)
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [dataStatus, setDataStatus] = useState('ok')
+  const [statusKnown, setStatusKnown] = useState(false)
   const cesiumRef = useRef(null)
 
   const threeRef = useRef({
@@ -87,6 +101,28 @@ export default function Console() {
   })
 
   useEffect(() => { activeDepthIdxRef.current = activeDepthIdx }, [activeDepthIdx])
+
+  // ── Data status: last successful GODAS + ARGO update ──
+  useEffect(() => {
+    let cancelled = false
+    async function loadStatus() {
+      try {
+        const resp = await fetch('/api/data-status')
+        if (!resp.ok) throw new Error('bad status')
+        const data = await resp.json()
+        if (cancelled) return
+        setLastUpdated(data.last_updated)
+        setDataStatus(data.status)
+        setStatusKnown(true)
+      } catch {
+        if (cancelled) return
+        setStatusKnown(false)
+      }
+    }
+    loadStatus()
+    const id = setInterval(loadStatus, 5 * 60 * 1000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
 
   // ── Resize Three.js when switching to layer view ──
   useEffect(() => {
@@ -421,7 +457,7 @@ export default function Console() {
         const currentsResp = await getCurrents(1)
         if (cancelled) return
         setCurrents(currentsResp.currents || [])
-        setDisclaimer(`Live data from GODAS model + ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''} — Indian Ocean, July 2026.`)
+        setDisclaimer(`Live data from GODAS model + ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''} — Indian Ocean, ${dataStatus === 'stale' ? 'Data may be stale' : dataStatus === 'never_updated' ? 'No data update yet' : 'Latest available data'}.`)
 
         initDepthMeshes(depthResp.depths.length)
         buildFloatMarkers()
@@ -491,7 +527,7 @@ export default function Console() {
         updateGridColors()
         updateFloatColors()
 
-        setDisclaimer(`Day ${activeDay} of ${totalDays} — ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''}, July 2026.`)
+        setDisclaimer(`Day ${activeDay} of ${totalDays} — ${floatData.float_count} ARGO float${floatData.float_count !== 1 ? 's' : ''}, ${dataStatus === 'stale' ? 'Data may be stale' : dataStatus === 'never_updated' ? 'No data update yet' : 'Latest available data'}.`)
       } catch (err) {
         console.error('Failed to load day:', err)
       }
@@ -592,6 +628,13 @@ export default function Console() {
             <span className="w-2 h-2 rounded-full bg-primary" />
             <span className="text-[12px] font-semibold tracking-wider text-on-surface uppercase">Arabian Sea Basin</span>
           </div>
+          <span className="text-outline-variant">•</span>
+          <span className="text-[12px] font-mono text-on-surface-variant">
+            {statusKnown && dataStatus === 'stale' ? 'Data stale: ' : 'Last updated: '}
+            <strong className="text-primary font-medium">
+              {!statusKnown ? 'Unknown' : dataStatus === 'never_updated' ? 'Never' : relativeTime(lastUpdated)}
+            </strong>
+          </span>
           {viewMode === 'layers' && (
             <>
               <span className="text-outline-variant">•</span>

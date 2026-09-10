@@ -12,14 +12,18 @@ Endpoints:
 All reads come from SQLite (ocean.db). Run preload_cache.py to populate it.
 """
 
+import asyncio
 import json
 import math
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+from backend.scheduler import read_status
 
 DB_PATH = Path(__file__).resolve().parent / "ocean.db"
 DEMO_VARIABLES = {"temperature", "salinity", "oxygen", "pressure"}
@@ -32,7 +36,16 @@ async def lifespan(app: FastAPI):
         print("DB not found — running preload_cache...")
         from backend.preload_cache import preload
         preload()
-    yield
+    from backend.scheduler import start_scheduler
+    scheduler_task = start_scheduler()
+    try:
+        yield
+    finally:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Ocean Viz API", lifespan=lifespan)
@@ -64,6 +77,31 @@ def get_db():
 @app.get("/health")
 def health():
     return {"status": "ok", "db_exists": DB_PATH.exists()}
+
+
+@app.get("/api/data-status")
+def data_status():
+    """Report the last successful GODAS + ARGO update.
+
+    status: ok            — last attempt succeeded and update is fresh
+            stale         — last scheduled attempt failed, or update > 24h old
+            never_updated — no successful fetch has happened yet
+    """
+    status = read_status()
+    last_updated = status.get("last_updated")
+    if not isinstance(last_updated, str):
+        return {"last_updated": None, "status": "never_updated"}
+
+    stale = status.get("last_attempt_success") is False
+    if not stale:
+        try:
+            updated_at = datetime.fromisoformat(last_updated)
+            if (datetime.now(timezone.utc) - updated_at).total_seconds() > 24 * 3600:
+                stale = True
+        except ValueError:
+            pass
+
+    return {"last_updated": last_updated, "status": "stale" if stale else "ok"}
 
 
 @app.get("/api/dates")

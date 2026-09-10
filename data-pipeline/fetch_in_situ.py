@@ -4,7 +4,7 @@ Uses the Argovis REST API (free, no registration required for basic queries).
 API docs: https://argovis-api.colorado.edu/docs/
 
 Region: Indian Ocean (40-100E, 10S-30N)
-Time:   July 2026 (matching GODAS model data)
+Time:   Last 30 days (matching GODAS model data)
 
 Usage:
   python -m data-pipeline.fetch_in_situ
@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -40,14 +41,19 @@ def build_polygon() -> str:
 
 
 def fetch_argo_profiles(
-    start_date: str = "2026-07-01",
-    end_date: str = "2026-07-31",
+    start_date: str | None = None,
+    end_date: str | None = None,
     limit: int = 100,
 ) -> list[dict]:
     """Fetch ARGO profiles from Argovis API.
 
     Returns raw API response (list of profile dicts with nested data arrays).
     """
+    today = date.today()
+    if start_date is None:
+        start_date = (today - timedelta(days=30)).isoformat()
+    if end_date is None:
+        end_date = today.isoformat()
     polygon = build_polygon()
     url = f"{ARGOVIS_BASE}/argo"
 
@@ -125,9 +131,10 @@ def parse_profile(profile: dict) -> list[dict]:
 
 
 def main():
+    today = date.today()
     parser = argparse.ArgumentParser(description="Fetch ARGO float data from Argovis")
-    parser.add_argument("--start", default="2026-07-01", help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", default="2026-07-31", help="End date (YYYY-MM-DD)")
+    parser.add_argument("--start", default=(today - timedelta(days=30)).isoformat(), help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", default=today.isoformat(), help="End date (YYYY-MM-DD)")
     parser.add_argument("--limit", type=int, default=100, help="Max profiles to process")
     parser.add_argument("--output", default=str(OUTPUT_FILE), help="Output JSON path")
     args = parser.parse_args()

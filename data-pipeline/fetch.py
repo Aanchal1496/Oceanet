@@ -45,9 +45,9 @@ GODAS_FTP = "https://ftp.cpc.ncep.noaa.gov/godas/monthly"
 
 
 def _recent_godas_months(n: int) -> list[str]:
-    """Return list of YYYYMM strings for the n most recent available months."""
-    today = date.today()
-    current = today.replace(day=1) - timedelta(days=60)
+    """Return list of YYYYMM strings for the n most recent months,
+    starting from the current month."""
+    current = date.today().replace(day=1)
     months = []
     for _ in range(n):
         months.append(current.strftime("%Y%m"))
