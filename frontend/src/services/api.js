@@ -22,6 +22,10 @@ export async function getFloats(day = 1) {
   return fetchJSON(`${API_BASE}/floats?day=${day}`);
 }
 
+export async function getCurrents(day = 1) {
+  return fetchJSON(`${API_BASE}/currents?day=${day}`);
+}
+
 export async function getFloatHistory(floatId) {
   return fetchJSON(`${API_BASE}/floats/${encodeURIComponent(floatId)}/history`);
 }

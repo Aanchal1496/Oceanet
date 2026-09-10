@@ -49,6 +49,35 @@ const COLOR_SCALES = {
       { t: 1.0, color: '#0d0d3b', label: '2000+' },
     ],
   },
+  oxygen: {
+    label: 'Dissolved Oxygen',
+    unit: 'µmol/kg',
+    stops: [
+      { t: 0.0, color: '#274e8c', label: '100' },
+      { t: 0.4, color: '#2fb6a8', label: '180' },
+      { t: 0.7, color: '#f2a65a', label: '240' },
+      { t: 1.0, color: '#e4572e', label: '300+' },
+    ],
+  },
+  pressure: {
+    label: 'Pressure',
+    unit: 'dbar',
+    stops: [
+      { t: 0.0, color: '#2fb6a8', label: '0' },
+      { t: 0.4, color: '#274e8c', label: '20' },
+      { t: 0.7, color: '#f2a65a', label: '40' },
+      { t: 1.0, color: '#e4572e', label: '60+' },
+    ],
+  },
+  currents: {
+    label: 'Wind / Current Speed',
+    unit: 'm/s',
+    stops: [
+      { t: 0.0, color: '#2fb6a8', label: '0' },
+      { t: 0.5, color: '#f2a65a', label: '1' },
+      { t: 1.0, color: '#e4572e', label: '2+' },
+    ],
+  },
 }
 
 export default function MapLegend({ variable = 'temperature' }) {

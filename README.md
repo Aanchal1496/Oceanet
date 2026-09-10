@@ -143,9 +143,13 @@ uvicorn backend.main:app --reload --port 8000
 ## Running the Frontend
 
 ```bash
-npx serve frontend
-# → open http://localhost:3000
+cd frontend
+npm install
+npm run dev
+# → open http://localhost:5173
 ```
+
+This is a Vite/React client, so it must be served through Vite; a static file server will return JSX as `text/jsx` and leave the page blank.
 
 ---
 

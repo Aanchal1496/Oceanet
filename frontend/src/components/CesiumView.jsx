@@ -1,6 +1,4 @@
-import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 'react'
-
-const CESIUM_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjJGdDB6MDFMSURaZnFIRjIiLCJqdGkiOiJjY2UxYThjZi0zYThjLTRhMDktODFmOS04Yjg4NGIwZGZiNzQiLCJpZCI6NDgwNjU1LCJpc3MiOiJodHRwczovL2FwaS5jZXNpdW0uY29tIiwiYXVkIjoidW5kZWZpbmVkX2RlZmF1bHQiLCJpYXQiOjE3ODg1MjMxNzZ9.MMr_DwSDj1BI5Jk1H_Dd1l23Q3BiJkjf9cNbUMw2s7I'
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from 'react'
 
 function getColorForValue(value, min, max, variable) {
   if (variable === 'delta') {
@@ -37,6 +35,29 @@ function getColorForValue(value, min, max, variable) {
   if (variable === 'anomaly') {
     return interpolateColor(t, [
       [0.0, [93, 218, 203]],
+      [0.5, [255, 184, 115]],
+      [1.0, [231, 76, 60]],
+    ])
+  }
+  if (variable === 'oxygen') {
+    return interpolateColor(t, [
+      [0.0, [39, 78, 140]],
+      [0.4, [47, 182, 168]],
+      [0.7, [242, 166, 90]],
+      [1.0, [228, 87, 46]],
+    ])
+  }
+  if (variable === 'pressure') {
+    return interpolateColor(t, [
+      [0.0, [47, 182, 168]],
+      [0.4, [39, 78, 140]],
+      [0.7, [242, 166, 90]],
+      [1.0, [228, 87, 46]],
+    ])
+  }
+  if (variable === 'currents') {
+    return interpolateColor(t, [
+      [0.0, [47, 182, 168]],
       [0.5, [255, 184, 115]],
       [1.0, [231, 76, 60]],
     ])
@@ -98,12 +119,12 @@ function clusterFloats(floats, cameraHeight, Cesium) {
 }
 
 function getClusterRadius(cameraHeight) {
-  if (cameraHeight > 8000000) return 8
-  if (cameraHeight > 5000000) return 5
-  if (cameraHeight > 3000000) return 3
-  if (cameraHeight > 1500000) return 1.5
-  if (cameraHeight > 800000) return 0.8
-  return 0.3
+  if (cameraHeight > 8000000) return 4
+  if (cameraHeight > 5000000) return 2.5
+  if (cameraHeight > 3000000) return 1.3
+  if (cameraHeight > 1500000) return 0.6
+  if (cameraHeight > 800000) return 0.3
+  return 0.12
 }
 
 export default forwardRef(function CesiumView({
@@ -117,11 +138,15 @@ export default forwardRef(function CesiumView({
   showTrajectory,
   trajectoryFloatId,
   comparisonMode,
+  currents = [],
 }, ref) {
+  const cesiumIonToken = import.meta.env.VITE_CESIUM_ION_TOKEN?.trim()
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
+  const [viewerReady, setViewerReady] = useState(false)
   const entitiesRef = useRef([])
   const clusterEntitiesRef = useRef([])
+  const currentEntitiesRef = useRef([])
   const trajectoryEntitiesRef = useRef([])
   const handlerRef = useRef(null)
   const lastCameraHeightRef = useRef(5000000)
@@ -134,6 +159,7 @@ export default forwardRef(function CesiumView({
       case 'salinity': return 34 + (surfaceObs.delta || 0) * 0.1
       case 'delta': return surfaceObs.delta || 0
       case 'anomaly': return Math.abs(surfaceObs.delta || 0)
+      case 'oxygen': return 220 - (surfaceObs.pressure_dbar || 0) * 0.18 + (surfaceObs.delta || 0) * 4
       case 'depth': return Math.max(...fd.observations.map(o => o.depth_m))
       case 'pressure': return surfaceObs.pressure_dbar || 0
       default: return surfaceObs.temperature || 0
@@ -152,6 +178,18 @@ export default forwardRef(function CesiumView({
     }
     if (!filters.status.inactive) {
       filtered = filtered.filter(fd => fd.status !== 'inactive')
+    }
+
+    if (filters.depth !== 'all') {
+      const ranges = {
+        surface: [0, 20],
+        '0-100': [0, 100],
+        '100-500': [100, 500],
+        '500-1000': [500, 1000],
+        '1000+': [1000, Infinity],
+      }
+      const [minDepth, maxDepth] = ranges[filters.depth] || [0, Infinity]
+      filtered = filtered.filter(fd => fd.observations?.some(obs => obs.depth_m >= minDepth && obs.depth_m < maxDepth))
     }
 
     if (anomalyMode === 'anomalies') {
@@ -173,11 +211,34 @@ export default forwardRef(function CesiumView({
     async function init() {
       const Cesium = await import('cesium')
       window.Cesium = Cesium
-      Cesium.Ion.defaultAccessToken = CESIUM_TOKEN
+
+      if (cesiumIonToken) {
+        Cesium.Ion.defaultAccessToken = cesiumIonToken
+      }
+
+      // Use public satellite tiles as the visual baseline. This keeps the
+      // Earth natural-looking without requiring an Ion account.
+      const satelliteLayer = new Cesium.ImageryLayer(
+        new Cesium.UrlTemplateImageryProvider({
+          url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+          maximumLevel: 19,
+          credit: new Cesium.Credit('Esri, Maxar, Earthstar Geographics, and the GIS User Community'),
+        }),
+      )
+
+      // OSM stays underneath as a resilient fallback if satellite tiles are
+      // unavailable or rate-limited.
+      const fallbackBaseLayer = new Cesium.ImageryLayer(
+        new Cesium.OpenStreetMapImageryProvider({
+          url: 'https://tile.openstreetmap.org/',
+        }),
+      )
 
       if (cancelled || !containerRef.current) return
 
       const viewer = new Cesium.Viewer(containerRef.current, {
+        baseLayer: satelliteLayer,
+        terrainProvider: new Cesium.EllipsoidTerrainProvider(),
         baseLayerPicker: false,
         geocoder: false,
         homeButton: false,
@@ -193,6 +254,7 @@ export default forwardRef(function CesiumView({
       })
 
       viewerRef.current = viewer
+      viewer.imageryLayers.add(fallbackBaseLayer, 0)
       viewer.resize()
       window.dispatchEvent(new Event('resize'))
 
@@ -202,12 +264,40 @@ export default forwardRef(function CesiumView({
       viewer.scene.fog.density = 0.0002
       viewer.scene.fog.screenSpaceErrorFactor = 4
       viewer.scene.globe.enableLighting = true
+      viewer.scene.globe.showGroundAtmosphere = true
+      viewer.scene.skyAtmosphere.show = true
+      viewer.scene.skyAtmosphere.atmosphereLightIntensity = 8.0
+      viewer.scene.skyAtmosphere.brightnessShift = 0.08
+      viewer.scene.skyAtmosphere.hueShift = -0.02
+      viewer.scene.skyAtmosphere.saturationShift = 0.08
+
+      // Upgrade to Ion only when a local Vite token is configured. The
+      // fallback layer stays underneath so a slow/invalid token never blanks
+      // the globe or prevents the API-backed float markers from rendering.
+      if (cesiumIonToken) {
+        const ionLayer = Cesium.ImageryLayer.fromWorldImagery()
+        ionLayer.errorEvent.addEventListener(() => {
+          if (!viewer.isDestroyed()) viewer.imageryLayers.remove(ionLayer, true)
+        })
+        viewer.imageryLayers.add(ionLayer)
+
+        Promise.race([
+          Cesium.createWorldTerrainAsync({ requestWaterMask: true, requestVertexNormals: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Cesium Ion terrain timed out')), 8000)),
+        ])
+          .then((terrainProvider) => {
+            if (!cancelled && !viewer.isDestroyed()) viewer.terrainProvider = terrainProvider
+          })
+          .catch((error) => {
+            console.warn('Cesium Ion terrain unavailable; keeping local terrain.', error)
+          })
+      }
 
       viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(70, 10, 5000000),
+        destination: Cesium.Cartesian3.fromDegrees(70, -8, 4200000),
         orientation: {
           heading: Cesium.Math.toRadians(0),
-          pitch: Cesium.Math.toRadians(-45),
+          pitch: Cesium.Math.toRadians(-72),
           roll: 0,
         },
         duration: 2,
@@ -226,7 +316,7 @@ export default forwardRef(function CesiumView({
       const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
       handler.setInputAction((movement) => {
         const picked = viewer.scene.pick(movement.endPosition)
-        if (Cesium.defined(picked) && picked.id?.userData) {
+        if (Cesium.defined(picked) && picked.id?.userData?.id) {
           onHoverFloat?.(picked.id.userData, {
             x: movement.endPosition.x,
             y: movement.endPosition.y,
@@ -241,12 +331,13 @@ export default forwardRef(function CesiumView({
       // Handle click
       handler.setInputAction((click) => {
         const picked = viewer.scene.pick(click.position)
-        if (Cesium.defined(picked) && picked.id?.userData) {
+        if (Cesium.defined(picked) && picked.id?.userData?.id) {
           onSelectFloat?.(picked.id.userData)
         }
       }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
 
       handlerRef.current = handler
+      setViewerReady(true)
     }
 
     init()
@@ -254,12 +345,15 @@ export default forwardRef(function CesiumView({
     return () => {
       cancelled = true
       handlerRef.current?.destroy()
+      setViewerReady(false)
       if (viewerRef.current) {
+        currentEntitiesRef.current.forEach(entity => viewerRef.current.entities.remove(entity))
+        currentEntitiesRef.current = []
         viewerRef.current.destroy()
         viewerRef.current = null
       }
     }
-  }, [])
+  }, [cesiumIonToken])
 
   // Update markers when data or filters change
   useEffect(() => {
@@ -267,7 +361,7 @@ export default forwardRef(function CesiumView({
     const Cesium = window.Cesium
     if (!Cesium) return
     updateMarkers(Cesium, viewerRef.current, lastCameraHeightRef.current)
-  }, [floatData, filters, mapMode, anomalyMode, selectedFloatId, comparisonMode])
+  }, [floatData, filters, mapMode, anomalyMode, selectedFloatId, comparisonMode, viewerReady])
 
   // Update trajectory when toggled
   useEffect(() => {
@@ -276,6 +370,14 @@ export default forwardRef(function CesiumView({
     if (!Cesium) return
     updateTrajectory(Cesium, viewerRef.current)
   }, [showTrajectory, trajectoryFloatId, floatData])
+
+  // Update the synthetic current vectors when the API response or mode changes.
+  useEffect(() => {
+    if (!viewerRef.current) return
+    const Cesium = window.Cesium
+    if (!Cesium) return
+    updateCurrentVectors(Cesium, viewerRef.current)
+  }, [currents, mapMode, viewerReady])
 
   function updateMarkers(Cesium, viewer, cameraHeight) {
     // Remove old entities
@@ -290,7 +392,7 @@ export default forwardRef(function CesiumView({
     if (!filtered.length) return
 
     // Compute value range for coloring
-    const variable = comparisonMode === 'difference' ? 'delta' : (mapMode === 'anomaly' ? 'anomaly' : (mapMode === 'salinity' ? 'salinity' : 'temperature'))
+    const variable = comparisonMode === 'difference' ? 'delta' : ['temperature', 'salinity', 'oxygen', 'pressure', 'anomaly'].includes(mapMode) ? mapMode : 'temperature'
     const values = filtered.map(fd => getFloatValue(fd, variable))
     const valueMin = Math.min(...values)
     const valueMax = Math.max(...values)
@@ -303,7 +405,7 @@ export default forwardRef(function CesiumView({
         // Single float - render individual marker
         const fd = cluster.floats[0]
         const value = getFloatValue(fd, variable)
-        const [r, g, b] = getColorForValue(value, valueMin, valueMax, variable)
+  const [r, g, b] = getColorForValue(value, valueMin, valueMax, variable)
         const color = Cesium.Color.fromCssColorString(`rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`)
 
         const isSelected = fd.id === selectedFloatId
@@ -369,6 +471,35 @@ export default forwardRef(function CesiumView({
         clusterEntitiesRef.current.push(clusterEntity)
       }
     })
+  }
+
+  function updateCurrentVectors(Cesium, viewer) {
+    currentEntitiesRef.current.forEach(entity => viewer.entities.remove(entity))
+    currentEntitiesRef.current = []
+
+    if (mapMode !== 'currents' || !currents?.length) return
+
+    const maxSpeed = Math.max(...currents.map(point => point.speed || 0), 1)
+    for (const point of currents) {
+      const scale = 1.15
+      const endLon = point.lon + point.u * scale
+      const endLat = point.lat + point.v * scale
+      const [r, g, b] = getColorForValue(point.speed || 0, 0, maxSpeed, 'currents')
+      const color = Cesium.Color.fromBytes(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 230)
+      const entity = viewer.entities.add({
+        polyline: {
+          positions: [
+            Cesium.Cartesian3.fromDegrees(point.lon, point.lat, 1800),
+            Cesium.Cartesian3.fromDegrees(endLon, endLat, 1800),
+          ],
+          width: 3,
+          material: new Cesium.PolylineArrowMaterialProperty(color),
+          clampToGround: true,
+        },
+        userData: point,
+      })
+      currentEntitiesRef.current.push(entity)
+    }
   }
 
   function updateTrajectory(Cesium, viewer) {
