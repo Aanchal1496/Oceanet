@@ -86,10 +86,12 @@ function getColorForValue(value, min, max, variable) {
   }
   if (variable === 'currents') {
     return interpolateColor(t, [
-      [0.0, [45, 104, 190]],
-      [0.45, [47, 182, 168]],
-      [0.78, [163, 237, 205]],
-      [1.0, [244, 255, 232]],
+      [0.00, [6, 21, 47]],    // #06152F - Slow: very dark navy/blue
+      [0.20, [7, 59, 115]],   // #073B73 - Low: deep saturated blue
+      [0.45, [8, 127, 155]],  // #087F9B - Medium: saturated blue/teal
+      [0.70, [0, 207, 232]],  // #00CFE8 - Fast: bright electric cyan
+      [0.88, [77, 235, 255]], // #4DEBFF - Very fast: brilliant luminous cyan
+      [1.00, [168, 85, 247]], // #A855F7 - Very fastest: vivid violet/purple
     ])
   }
   if (variable === 'depth') {
@@ -183,6 +185,8 @@ export default forwardRef(function CesiumView({
   const trajectoryEntitiesRef = useRef([])
   const handlerRef = useRef(null)
   const lastCameraHeightRef = useRef(5000000)
+  const [currentsLoading, setCurrentsLoading] = useState(false)
+  const buildCurrentsTimeoutRef = useRef(null)
 
   const getFloatValue = useCallback((fd, variable) => {
     if (!fd.observations?.length) return 0
@@ -382,6 +386,10 @@ export default forwardRef(function CesiumView({
 
     return () => {
       cancelled = true
+      if (buildCurrentsTimeoutRef.current) {
+        clearTimeout(buildCurrentsTimeoutRef.current)
+        buildCurrentsTimeoutRef.current = null
+      }
       handlerRef.current?.destroy()
       setViewerReady(false)
       if (viewerRef.current) {
@@ -513,19 +521,46 @@ export default forwardRef(function CesiumView({
   }
 
   function updateCurrentVectors(Cesium, viewer) {
-    currentEntitiesRef.current.forEach(entity => viewer.entities.remove(entity))
-    currentEntitiesRef.current = []
+    if (buildCurrentsTimeoutRef.current) {
+      clearTimeout(buildCurrentsTimeoutRef.current)
+      buildCurrentsTimeoutRef.current = null
+    }
 
-    if (mapMode !== 'currents' || !currents?.length) return
+    // Immediately remove and hide any existing current entities from the scene
+    if (currentEntitiesRef.current.length) {
+      viewer.entities.suspendEvents()
+      currentEntitiesRef.current.forEach(entity => viewer.entities.remove(entity))
+      currentEntitiesRef.current = []
+      viewer.entities.resumeEvents()
+    }
+
+    if (mapMode !== 'currents' || !currents?.length) {
+      setCurrentsLoading(false)
+      return
+    }
+
+    // Indicate loading immediately so no unstyled or old visuals show
+    setCurrentsLoading(true)
+
+    // Defer the heavy streamline build and entity creation by a tick so the DOM
+    // can display the loading indicator and Cesium can paint a clean frame.
+    buildCurrentsTimeoutRef.current = setTimeout(() => {
+      buildCurrentsTimeoutRef.current = null
+      if (!viewer || viewer.isDestroyed() || mapMode !== 'currents') {
+        setCurrentsLoading(false)
+        return
+      }
 
     // The API returns a vector grid. Interpolate the nearest six vectors so
     // the visual layer can draw smooth streamlines between grid cells rather
-    // than a sparse collection of disconnected arrows.
+    // than a sparse collection of disconnected arrows. The grid is binned so
+    // field sampling stays O(1): dense, long streamlines need tens of
+    // thousands of samples and a full scan every sample would stall the UI.
     const vectorGrid = currents.map(point => ({
       ...point,
       speed: point.speed || Math.hypot(point.u || 0, point.v || 0),
     }))
-    const maxSpeed = Math.max(...currents.map(point => point.speed || 0), 1)
+    const maxSpeed = Math.max(...vectorGrid.map(point => point.speed || 0), 1)
 
     const lats = vectorGrid.map(point => point.lat)
     const lons = vectorGrid.map(point => point.lon)
@@ -533,12 +568,35 @@ export default forwardRef(function CesiumView({
     const maxLat = Math.max(...lats)
     const minLon = Math.min(...lons)
     const maxLon = Math.max(...lons)
-    const latPad = 2.5
-    const lonPad = 2.5
+    const latPad = 3
+    const lonPad = 3
     const radians = Math.PI / 180
 
+    const binSize = 5
+    const bins = new Map()
+    const binKey = (i, j) => `${i},${j}`
+    for (const point of vectorGrid) {
+      const i = Math.floor((point.lon - minLon) / binSize)
+      const j = Math.floor((point.lat - minLat) / binSize)
+      const key = binKey(i, j)
+      if (!bins.has(key)) bins.set(key, [])
+      bins.get(key).push(point)
+    }
+
     const sampleField = (lon, lat) => {
-      const nearest = vectorGrid
+      const i = Math.floor((lon - minLon) / binSize)
+      const j = Math.floor((lat - minLat) / binSize)
+      // Cull to the 3x3 cell neighbourhood around the sample point. The grid
+      // is spaced at binSize, so the six nearest vectors always live here.
+      const candidates = []
+      for (let di = -1; di <= 1; di++) {
+        for (let dj = -1; dj <= 1; dj++) {
+          const cell = bins.get(binKey(i + di, j + dj))
+          if (cell) for (const point of cell) candidates.push(point)
+        }
+      }
+
+      const nearest = candidates
         .map(point => {
           const dx = (point.lon - lon) * Math.cos(lat * radians)
           const dy = point.lat - lat
@@ -564,29 +622,45 @@ export default forwardRef(function CesiumView({
     }
 
     const clamp = (value, low, high) => Math.max(low, Math.min(high, value))
+    // Integrate the field. The previous-velocity blend dampens kinks so the
+    // curves read as fluid; the velocity-scaled step lets fast jets stretch
+    // out while slow water curls. Many small steps give long, unbroken arcs
+    // that trace the eddies instead of stalling into short strokes.
     const buildStreamline = (seedLon, seedLat) => {
       if (isIndianOceanLand(seedLon, seedLat)) return []
       const path = []
       let lon = seedLon
       let lat = seedLat
-      for (let step = 0; step < 46; step++) {
+      let prevU = null
+      let prevV = null
+      let stagnant = 0
+      for (let step = 0; step < 340; step++) {
         path.push({ lon, lat })
         const field = sampleField(lon, lat)
-        // The scale is visual degrees per sample, not a physical time step.
-        const nextLon = clamp(lon + field.u * 0.34, minLon - lonPad, maxLon + lonPad)
-        const nextLat = clamp(lat + field.v * 0.34, minLat - latPad, maxLat + latPad)
+        const u = prevU === null ? field.u : prevU * 0.35 + field.u * 0.65
+        const v = prevV === null ? field.v : prevV * 0.35 + field.v * 0.65
+        prevU = u
+        prevV = v
+        const stepLen = 0.24 * (0.7 + 0.5 * Math.min(field.speed, 1.6))
+        const nextLon = clamp(lon + u * stepLen, minLon - lonPad, maxLon + lonPad)
+        const nextLat = clamp(lat + v * stepLen, minLat - latPad, maxLat + latPad)
         if (isIndianOceanLand(nextLon, nextLat)) break
+        // A genuinely vanished current gives up after a while; anything that
+        // still moves keeps flowing so the field reads continuous.
+        stagnant = Math.abs(nextLon - lon) < 4e-4 && Math.abs(nextLat - lat) < 4e-4 ? stagnant + 1 : 0
+        if (stagnant > 10) break
         lon = nextLon
         lat = nextLat
       }
       return path
     }
 
-    const trailLength = 9
+    const trailLength = 12
     const streamlines = []
     let seedIndex = 0
-    for (let lat = minLat - 1; lat <= maxLat + 1; lat += 2.45) {
-      for (let lon = minLon - 1; lon <= maxLon + 1; lon += 2.45) {
+    const seedSpacing = 1.6
+    for (let lat = minLat - 1; lat <= maxLat + 1; lat += seedSpacing) {
+      for (let lon = minLon - 1; lon <= maxLon + 1; lon += seedSpacing) {
         const path = buildStreamline(lon, lat)
         if (path.length < 2) continue
         const field = sampleField(lon, lat)
@@ -594,53 +668,108 @@ export default forwardRef(function CesiumView({
         const [r, g, b] = getColorForValue(speed, 0, maxSpeed, 'currents')
         streamlines.push({
           path,
+          positions: path.map(p => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, 2400)),
           speed,
           lat,
           lon,
           direction: (Math.atan2(field.u, field.v) * 180 / Math.PI + 360) % 360,
           phase: (seedIndex * 0.173) % 1,
-          color: Cesium.Color.fromBytes(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 220),
+          color: Cesium.Color.fromBytes(Math.round(r), Math.round(g), Math.round(b), 240),
         })
         seedIndex += 1
       }
     }
 
-    for (const streamline of streamlines) {
-      const getTrailPositions = (length, now) => {
-        const path = streamline.path
-        const head = Math.floor((((now / 5200) + streamline.phase) % 1) * path.length)
-        const positions = []
-        for (let offset = length - 1; offset >= 0; offset--) {
-          const sampleIndex = ((head - offset) % path.length + path.length) % path.length
-          const sample = path[sampleIndex]
-          positions.push(Cesium.Cartesian3.fromDegrees(sample.lon, sample.lat, 2400))
-        }
-        return positions
+      // Batch all entity additions into a single event cycle so Cesium does not
+      // thrash event listeners or display intermediate uninitialized polylines.
+      viewer.entities.suspendEvents()
+
+      // Current metadata attached to every entity so hover/inspect picking can
+      // report source, timestamp and speed for any visible streamline.
+      const currentUserData = (streamline) => ({
+        kind: 'current',
+        lat: streamline.lat,
+        lon: streamline.lon,
+        speed: streamline.speed,
+        direction: streamline.direction,
+        source: currentSource || 'unavailable',
+        timestamp: currentTimestamp || null,
+      })
+
+      // Static pass: every streamline drawn in full, creating a dense field of
+      // long continuous curves that follow the flow. A plain solid material
+      // renders the whole 340-point path as one unbroken stroke.
+      for (const streamline of streamlines) {
+        const prominence = Math.min(streamline.speed / maxSpeed, 1)
+        const staticWidth = 1.35 + 1.30 * Math.pow(prominence, 1.2)
+        const staticAlpha = 0.55 + 0.40 * Math.pow(prominence, 1.1)
+        const lineEntity = viewer.entities.add({
+          polyline: {
+            positions: streamline.positions,
+            width: staticWidth,
+            material: new Cesium.ColorMaterialProperty(
+              streamline.color.withAlpha(staticAlpha)
+            ),
+            clampToGround: false,
+          },
+          userData: currentUserData(streamline),
+        })
+        currentEntitiesRef.current.push(lineEntity)
       }
 
-      const lineEntity = viewer.entities.add({
-        polyline: {
-          positions: new Cesium.CallbackProperty(() => getTrailPositions(trailLength, performance.now()), false),
-          width: 1.25,
-          material: new Cesium.PolylineGlowMaterialProperty({
-            glowPower: 0.05,
-            taperPower: 0.9,
-            color: streamline.color.withAlpha(0.58),
-          }),
-          clampToGround: true,
-        },
-        userData: {
-          kind: 'current',
-          lat: streamline.lat,
-          lon: streamline.lon,
-          speed: streamline.speed,
-          direction: streamline.direction,
-          source: currentSource || 'unavailable',
-          timestamp: currentTimestamp || null,
-        },
+      // Animated pass: a subset of the streamlines carry a comet tail so the flow
+      // reads as water continuously moving along its U/V direction. Positions
+      // are windowed from the precomputed path as a contiguous run — never
+      // modulo-wrapped, which would make the tail span a seam and teleport.
+      // Fractional indexing keeps the head gliding instead of stepping.
+      let animIndex = 0
+      for (const streamline of streamlines) {
+        if (animIndex++ % 3 !== 0) continue
+        const positions = streamline.positions
+        const n = positions.length
+        // Speed-coupled pacing: slow water drifts, fast jets race. Varying the
+        // period also de-syncs the comets so the field never looks metronomic.
+        const period = 5200 * (0.85 + 0.55 * Math.min(streamline.speed / maxSpeed, 1))
+        const getTrailPositions = (now) => {
+          const p = ((now / period) + streamline.phase) % 1
+          const head = Math.min(n - 1, Math.floor(p * n))
+          const trail = []
+          for (let offset = 0; offset < trailLength; offset++) {
+            trail.push(positions[Math.max(0, head - offset)])
+          }
+          return trail
+        }
+
+        const prominence = Math.min(streamline.speed / maxSpeed, 1)
+        const cometWidth = 1.40 + 1.80 * Math.pow(prominence, 1.2)
+        const cometGlow = 0.15 + 0.28 * Math.pow(prominence, 1.4)
+        const cometAlpha = 0.62 + 0.36 * Math.pow(prominence, 1.1)
+        const cometEntity = viewer.entities.add({
+          polyline: {
+            positions: new Cesium.CallbackProperty(() => getTrailPositions(performance.now()), false),
+            width: cometWidth,
+            material: new Cesium.PolylineGlowMaterialProperty({
+              glowPower: cometGlow,
+              taperPower: 0.85,
+              color: streamline.color.withAlpha(cometAlpha),
+            }),
+            clampToGround: false,
+          },
+          userData: currentUserData(streamline),
+        })
+        currentEntitiesRef.current.push(cometEntity)
+      }
+
+      viewer.entities.resumeEvents()
+
+      // Render the scene once with materials loaded, then dismiss the loading indicator
+      requestAnimationFrame(() => {
+        if (viewer && !viewer.isDestroyed()) {
+          viewer.scene.requestRender()
+        }
+        setCurrentsLoading(false)
       })
-      currentEntitiesRef.current.push(lineEntity)
-    }
+    }, 40)
   }
 
   function updateTrajectory(Cesium, viewer) {
@@ -702,7 +831,6 @@ export default forwardRef(function CesiumView({
 
   return (
     <div
-      ref={containerRef}
       data-testid="earth-map"
       aria-label="Interactive Indian Ocean globe"
       style={{
@@ -715,6 +843,27 @@ export default forwardRef(function CesiumView({
         bottom: 0,
         overflow: 'hidden',
       }}
-    />
+    >
+      <div
+        ref={containerRef}
+        style={{
+          width: '100%',
+          height: '100%',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+        }}
+      />
+      {currentsLoading && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-30 pointer-events-none transition-all duration-300">
+          <div className="flex items-center gap-2.5 px-4 py-2 rounded-full bg-surface-container-lowest/85 backdrop-blur-md border border-outline-variant/30 shadow-lg shadow-black/40 text-[12px] font-mono text-cyan-200">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+            <span>Rendering current streamlines...</span>
+          </div>
+        </div>
+      )}
+    </div>
   )
 })
