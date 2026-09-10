@@ -10,14 +10,6 @@ const DEPTH_OPTIONS = [
 const VARIABLE_OPTIONS = [
   { label: 'Temperature', value: 'temperature' },
   { label: 'Salinity', value: 'salinity' },
-  { label: 'Oxygen', value: 'oxygen' },
-  { label: 'Pressure', value: 'pressure' },
-  { label: 'ΔT', value: 'delta' },
-]
-
-const ANOMALY_OPTIONS = [
-  { label: 'All Observations', value: 'all' },
-  { label: 'Anomalies Only', value: 'anomalies' },
 ]
 
 export default function LeftFilterPanel({
@@ -100,18 +92,6 @@ export default function LeftFilterPanel({
               label={opt.label}
               checked={filters.depth === opt.value}
               onChange={() => update('depth', opt.value)}
-            />
-          ))}
-        </FilterSection>
-
-        {/* Anomaly */}
-        <FilterSection title="Anomaly">
-          {ANOMALY_OPTIONS.map(opt => (
-            <Radio
-              key={opt.value}
-              label={opt.label}
-              checked={filters.anomalyMode === opt.value}
-              onChange={() => update('anomalyMode', opt.value)}
             />
           ))}
         </FilterSection>

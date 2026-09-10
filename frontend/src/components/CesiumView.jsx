@@ -1,5 +1,34 @@
 import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from 'react'
 
+// Coarse coastline mask for the Indian Ocean demo domain. It is intentionally
+// conservative: a small amount of water near a coast is preferable to drawing
+// a current through a visible landmass when the API only provides vectors.
+const INDIAN_OCEAN_LAND = [
+  [[40, 25], [47, 25], [45, 15], [47, 5], [45, -5], [48, -15], [51, -25], [40, -25]], // East Africa
+  [[40, 25], [61, 25], [59, 17], [54, 12], [49, 12], [45, 17]], // Arabian Peninsula
+  [[67, 25], [90, 25], [89, 21], [86, 18], [84, 13], [80, 8], [76, 8], [73, 14], [69, 20]], // India
+  [[90, 25], [110, 25], [110, 8], [105, 8], [102, 12], [98, 16], [94, 21]], // Southeast Asia
+  [[79.5, 10], [82.2, 10], [82.2, 6], [80, 5.5], [79.1, 7.2]], // Sri Lanka
+  [[95, 5], [104, 6], [106, 1], [104, -5], [101, -6], [98, -3], [96, 0]], // Sumatra
+  [[104, -6], [110, -6], [110, -11], [104, -10]], // Java
+  [[49, -12], [51, -17], [50, -23], [47, -26], [43, -24], [43, -16], [46, -12]], // Madagascar
+]
+
+function pointInPolygon(lon, lat, polygon) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i]
+    const [xj, yj] = polygon[j]
+    const intersects = ((yi > lat) !== (yj > lat)) && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi
+    if (intersects) inside = !inside
+  }
+  return inside
+}
+
+function isIndianOceanLand(lon, lat) {
+  return INDIAN_OCEAN_LAND.some(polygon => pointInPolygon(lon, lat, polygon))
+}
+
 function getColorForValue(value, min, max, variable) {
   if (variable === 'delta') {
     const range = Math.max(Math.abs(min), Math.abs(max)) || 2
@@ -57,9 +86,10 @@ function getColorForValue(value, min, max, variable) {
   }
   if (variable === 'currents') {
     return interpolateColor(t, [
-      [0.0, [47, 182, 168]],
-      [0.5, [255, 184, 115]],
-      [1.0, [231, 76, 60]],
+      [0.0, [45, 104, 190]],
+      [0.45, [47, 182, 168]],
+      [0.78, [163, 237, 205]],
+      [1.0, [244, 255, 232]],
     ])
   }
   if (variable === 'depth') {
@@ -387,6 +417,7 @@ export default forwardRef(function CesiumView({
     clusterEntitiesRef.current = []
 
     if (!floatData?.floats) return
+    if (mapMode === 'currents') return
 
     const filtered = filterFloats(floatData.floats)
     if (!filtered.length) return
@@ -479,26 +510,115 @@ export default forwardRef(function CesiumView({
 
     if (mapMode !== 'currents' || !currents?.length) return
 
+    // The API returns a vector grid. Interpolate the nearest six vectors so
+    // the visual layer can draw smooth streamlines between grid cells rather
+    // than a sparse collection of disconnected arrows.
+    const vectorGrid = currents.map(point => ({
+      ...point,
+      speed: point.speed || Math.hypot(point.u || 0, point.v || 0),
+    }))
     const maxSpeed = Math.max(...currents.map(point => point.speed || 0), 1)
-    for (const point of currents) {
-      const scale = 1.15
-      const endLon = point.lon + point.u * scale
-      const endLat = point.lat + point.v * scale
-      const [r, g, b] = getColorForValue(point.speed || 0, 0, maxSpeed, 'currents')
-      const color = Cesium.Color.fromBytes(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 230)
-      const entity = viewer.entities.add({
+
+    const lats = vectorGrid.map(point => point.lat)
+    const lons = vectorGrid.map(point => point.lon)
+    const minLat = Math.min(...lats)
+    const maxLat = Math.max(...lats)
+    const minLon = Math.min(...lons)
+    const maxLon = Math.max(...lons)
+    const latPad = 2.5
+    const lonPad = 2.5
+    const radians = Math.PI / 180
+
+    const sampleField = (lon, lat) => {
+      const nearest = vectorGrid
+        .map(point => {
+          const dx = (point.lon - lon) * Math.cos(lat * radians)
+          const dy = point.lat - lat
+          return { point, distance: Math.hypot(dx, dy) }
+        })
+        .sort((a, b) => a.distance - b.distance)
+        .slice(0, 6)
+
+      let totalWeight = 0
+      let u = 0
+      let v = 0
+      let speed = 0
+      for (const item of nearest) {
+        const weight = 1 / Math.max(0.35, item.distance)
+        totalWeight += weight
+        u += (item.point.u || 0) * weight
+        v += (item.point.v || 0) * weight
+        speed += item.point.speed * weight
+      }
+
+      if (!totalWeight) return { u: 0.1, v: 0, speed: 0.1 }
+      return { u: u / totalWeight, v: v / totalWeight, speed: speed / totalWeight }
+    }
+
+    const clamp = (value, low, high) => Math.max(low, Math.min(high, value))
+    const buildStreamline = (seedLon, seedLat) => {
+      if (isIndianOceanLand(seedLon, seedLat)) return []
+      const path = []
+      let lon = seedLon
+      let lat = seedLat
+      for (let step = 0; step < 46; step++) {
+        path.push({ lon, lat })
+        const field = sampleField(lon, lat)
+        // The scale is visual degrees per sample, not a physical time step.
+        const nextLon = clamp(lon + field.u * 0.34, minLon - lonPad, maxLon + lonPad)
+        const nextLat = clamp(lat + field.v * 0.34, minLat - latPad, maxLat + latPad)
+        if (isIndianOceanLand(nextLon, nextLat)) break
+        lon = nextLon
+        lat = nextLat
+      }
+      return path
+    }
+
+    const trailLength = 9
+    const streamlines = []
+    let seedIndex = 0
+    for (let lat = minLat - 1; lat <= maxLat + 1; lat += 2.45) {
+      for (let lon = minLon - 1; lon <= maxLon + 1; lon += 2.45) {
+        const path = buildStreamline(lon, lat)
+        if (path.length < 2) continue
+        const speed = sampleField(lon, lat).speed
+        const [r, g, b] = getColorForValue(speed, 0, maxSpeed, 'currents')
+        streamlines.push({
+          path,
+          speed,
+          phase: (seedIndex * 0.173) % 1,
+          color: Cesium.Color.fromBytes(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 220),
+        })
+        seedIndex += 1
+      }
+    }
+
+    for (const streamline of streamlines) {
+      const getTrailPositions = (length, now) => {
+        const path = streamline.path
+        const head = Math.floor((((now / 5200) + streamline.phase) % 1) * path.length)
+        const positions = []
+        for (let offset = length - 1; offset >= 0; offset--) {
+          const sampleIndex = ((head - offset) % path.length + path.length) % path.length
+          const sample = path[sampleIndex]
+          positions.push(Cesium.Cartesian3.fromDegrees(sample.lon, sample.lat, 2400))
+        }
+        return positions
+      }
+
+      const lineEntity = viewer.entities.add({
         polyline: {
-          positions: [
-            Cesium.Cartesian3.fromDegrees(point.lon, point.lat, 1800),
-            Cesium.Cartesian3.fromDegrees(endLon, endLat, 1800),
-          ],
-          width: 3,
-          material: new Cesium.PolylineArrowMaterialProperty(color),
+          positions: new Cesium.CallbackProperty(() => getTrailPositions(trailLength, performance.now()), false),
+          width: 1.25,
+          material: new Cesium.PolylineGlowMaterialProperty({
+            glowPower: 0.05,
+            taperPower: 0.9,
+            color: streamline.color.withAlpha(0.58),
+          }),
           clampToGround: true,
         },
-        userData: point,
       })
-      currentEntitiesRef.current.push(entity)
+      currentEntitiesRef.current.push(lineEntity)
     }
   }
 

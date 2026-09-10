@@ -70,12 +70,13 @@ const COLOR_SCALES = {
     ],
   },
   currents: {
-    label: 'Wind / Current Speed',
+    label: 'Ocean Current Speed',
     unit: 'm/s',
     stops: [
-      { t: 0.0, color: '#2fb6a8', label: '0' },
-      { t: 0.5, color: '#f2a65a', label: '1' },
-      { t: 1.0, color: '#e4572e', label: '2+' },
+      { t: 0.0, color: '#2d68be', label: '0' },
+      { t: 0.45, color: '#2fb6a8', label: '0.5' },
+      { t: 0.78, color: '#a3edcd', label: '1' },
+      { t: 1.0, color: '#f4ffe8', label: '2+' },
     ],
   },
 }

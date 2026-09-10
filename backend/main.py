@@ -109,13 +109,34 @@ def _synthetic_grid(variable: str, depth_m: float, day: int) -> list[dict]:
 
 
 def _synthetic_currents(day: int) -> list[dict]:
-    """Create a stable Indian Ocean surface wind/current demo field."""
+    """Create a stable, eddy-rich Indian Ocean surface current demo field."""
+    # A few broad rotating cells make the demo field read like an ocean
+    # circulation map instead of a uniform wind grid. Signs alternate so the
+    # streamlines form both cyclonic and anticyclonic-looking eddies.
+    eddies = [
+        (51.0, -10.0, 1.15, 10.0),
+        (63.0, 2.0, -0.9, 8.0),
+        (76.0, -13.0, 1.0, 11.0),
+        (91.0, 5.0, -1.05, 10.0),
+        (104.0, -14.0, 0.8, 8.0),
+        (58.0, 9.0, -0.65, 7.0),
+    ]
     points = []
     for lat in range(-25, 26, 5):
         for lon in range(40, 111, 5):
-            phase = math.radians(lon + day * 8)
-            u = 0.7 * math.cos(math.radians(lat * 2)) + 0.35 * math.sin(phase)
-            v = 0.55 * math.sin(phase * 1.25) - 0.2 * math.sin(math.radians(lat * 3))
+            seasonal_phase = math.radians(day * 10)
+            u = 0.18 * math.cos(math.radians(lat * 2)) + 0.14 * math.sin(math.radians(lon * 2) + seasonal_phase)
+            v = 0.12 * math.cos(math.radians(lon * 3) - seasonal_phase) - 0.08 * math.sin(math.radians(lat * 4))
+
+            for center_lon, center_lat, strength, radius in eddies:
+                dx = (lon - center_lon) * math.cos(math.radians(lat))
+                dy = lat - center_lat
+                distance = max(math.hypot(dx, dy), 1.0)
+                envelope = math.exp(-((distance / radius) ** 2) * 1.5)
+                # Tangential flow around each eddy centre.
+                u += -strength * envelope * dy / distance
+                v += strength * envelope * dx / distance
+
             speed = math.sqrt(u * u + v * v)
             direction = (math.degrees(math.atan2(u, v)) + 360) % 360
             points.append({

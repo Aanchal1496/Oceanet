@@ -7,7 +7,6 @@ import FloatDetailsPanel from '../components/FloatDetailsPanel'
 import MapLegend from '../components/MapLegend'
 import Timeline from '../components/Timeline'
 import MapModeSelector from '../components/MapModeSelector'
-import AnomalyToggle from '../components/AnomalyToggle'
 import FloatTooltip from '../components/FloatTooltip'
 import StatsBar from '../components/StatsBar'
 import FindRegionButton from '../components/FindRegionButton'
@@ -64,7 +63,7 @@ export default function Console() {
   const [filterCollapsed, setFilterCollapsed] = useState(() => (
     typeof window !== 'undefined' && window.innerWidth < 768
   ))
-  const [mapMode, setMapMode] = useState('floats')
+  const [mapMode, setMapMode] = useState('density')
   const [anomalyMode, setAnomalyMode] = useState('all')
   const [hoveredFloat, setHoveredFloat] = useState(null)
   const [tooltipPos, setTooltipPos] = useState(null)
@@ -311,46 +310,63 @@ export default function Console() {
       }
       geo.attributes.color.needsUpdate = true
       geo.attributes.position.needsUpdate = true
-      T.depthMeshes[di].material.opacity = di === currentIdx ? 0.95 : 0.16
-      T.depthWireframes[di].material.opacity = di === currentIdx ? 0.4 : 0.12
+      T.depthMeshes[di].material.opacity = di === currentIdx ? 0.82 : 0.08
+      T.depthWireframes[di].material.opacity = di === currentIdx ? 0.3 : 0.06
     }
   }
 
   function updateFloatColors() {
     const T = threeRef.current
     if (!T.scene) return
-    T.floatMeshes.forEach(({ mesh, data }) => {
+    T.floatMeshes.forEach(({ mesh, halo, data }) => {
       if (data.observations && data.observations.length > 0) {
         const meanDelta = data.observations.reduce((s, o) => s + Math.abs(o.delta || 0), 0) / data.observations.length
         const t = Math.min(1, meanDelta / 2.5)
         mesh.material.color.setRGB(0.25 + 0.7 * t, 0.75 - 0.55 * t, 0.35 * (1 - t))
       }
-      mesh.scale.setScalar(mesh === T.selectedFloatMesh ? 1.7 : 1.0)
+      const selected = mesh === T.selectedFloatMesh
+      mesh.scale.setScalar(selected ? 1.45 : 1.0)
+      if (halo) halo.scale.setScalar(selected ? 1.35 : 1.0)
     })
   }
 
   function buildFloatMarkers() {
     const T = threeRef.current
     if (!T.scene) return
-    T.floatMeshes.forEach(m => { T.scene.remove(m.mesh); T.scene.remove(m.line) })
+    T.floatMeshes.forEach(m => { T.scene.remove(m.mesh); T.scene.remove(m.line); T.scene.remove(m.halo) })
     T.floatMeshes = []
     if (!T.allFloatData || !T.allFloatData.floats || !T.gridLats.length) return
     const lats = T.gridLats, lons = T.gridLons
     T.allFloatData.floats.forEach(fd => {
       const x = ((fd.lon - lons[0]) / (lons[lons.length - 1] - lons[0]) - 0.5) * (N - 1) * SPACING
       const z = ((fd.lat - lats[0]) / (lats[lats.length - 1] - lats[0]) - 0.5) * (M - 1) * SPACING
-      const geo = new THREE.SphereGeometry(0.14, 16, 16)
-      const mat = new THREE.MeshBasicMaterial({ color: 0xe8f1f2 })
+      // Float markers sit clearly above the active surface. The stem and
+      // footprint keep their relationship to the field without merging into
+      // the surface colors.
+      const markerY = 1.12
+      const surfaceY = 0.72
+      const geo = new THREE.SphereGeometry(0.1, 14, 10)
+      const mat = new THREE.MeshBasicMaterial({ color: 0xf4fbff })
       const mesh = new THREE.Mesh(geo, mat)
-      mesh.position.set(x, 0.5, z)
+      mesh.position.set(x, markerY, z)
+      mesh.renderOrder = 4
       mesh.userData = fd
       T.scene.add(mesh)
-      const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x, 0.5, z), new THREE.Vector3(x, 0, z)])
-      const lineMat = new THREE.LineDashedMaterial({ color: 0x8fa6b3, dashSize: 0.06, gapSize: 0.06 })
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x, markerY - 0.08, z), new THREE.Vector3(x, surfaceY, z)])
+      const lineMat = new THREE.LineDashedMaterial({ color: 0x92c2cc, transparent: true, opacity: 0.65, dashSize: 0.08, gapSize: 0.07 })
       const line = new THREE.Line(lineGeo, lineMat)
       line.computeLineDistances()
+      line.renderOrder = 3
       T.scene.add(line)
-      T.floatMeshes.push({ mesh, line, data: fd })
+      const halo = new THREE.Mesh(
+        new THREE.TorusGeometry(0.15, 0.018, 6, 24),
+        new THREE.MeshBasicMaterial({ color: 0x5ddacb, transparent: true, opacity: 0.55, depthWrite: false }),
+      )
+      halo.rotation.x = Math.PI / 2
+      halo.position.set(x, surfaceY + 0.015, z)
+      halo.renderOrder = 2
+      T.scene.add(halo)
+      T.floatMeshes.push({ mesh, line, halo, data: fd })
     })
   }
 
@@ -526,29 +542,24 @@ export default function Console() {
     }
   }, [showTrajectory, trajectoryFloatId])
 
-  // Handler for anomaly mode toggle
-  const handleAnomalyToggle = useCallback((mode) => {
-    setAnomalyMode(mode)
-    setFilters(prev => ({ ...prev, anomalyMode: mode }))
-  }, [])
-
   const handleMapModeChange = useCallback((mode) => {
+    if (!['density', 'temperature', 'salinity', 'currents'].includes(mode)) return
     setMapMode(mode)
-    if (mode === 'anomaly') setAnomalyMode('anomalies')
-    if (mode !== 'anomaly' && anomalyMode === 'anomalies') setAnomalyMode('all')
-    if (['temperature', 'salinity', 'oxygen', 'pressure'].includes(mode)) {
+    setAnomalyMode('all')
+    if (['temperature', 'salinity'].includes(mode)) {
       setFilters(prev => ({ ...prev, variable: mode }))
     }
-  }, [anomalyMode])
+    setFilters(prev => ({ ...prev, anomalyMode: 'all' }))
+  }, [])
 
   const handleFiltersChange = useCallback((nextFilters) => {
+    const variableChanged = nextFilters.variable !== filters.variable
     setFilters(nextFilters)
-    const nextMode = nextFilters.variable === 'delta' ? 'anomaly' : nextFilters.variable
-    if (['temperature', 'salinity', 'oxygen', 'pressure', 'anomaly'].includes(nextMode)) {
-      setMapMode(nextMode)
+    if (variableChanged && ['temperature', 'salinity'].includes(nextFilters.variable)) {
+      setMapMode(nextFilters.variable)
     }
-    setAnomalyMode(nextFilters.anomalyMode)
-  }, [])
+    setAnomalyMode(nextFilters.anomalyMode || 'all')
+  }, [filters.variable])
 
   // Handler for finding interesting regions
   const handleFindRegions = useCallback((regions) => {
@@ -573,7 +584,7 @@ export default function Console() {
   const floatCount = cesiumFloatData?.float_count || 0
 
   return (
-    <div className="h-screen w-screen bg-background overflow-hidden relative select-none">
+    <div className="min-h-dvh w-screen bg-background overflow-hidden relative select-none">
       {/* Loading overlay */}
       {loading && (
         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background/65 backdrop-blur-sm">
@@ -591,8 +602,8 @@ export default function Console() {
 
       {/* Top HUD strip */}
       {!presMode && (
-      <div className="absolute top-2 left-3 right-3 z-30 flex items-center justify-between pointer-events-none">
-        <div className="flex items-center gap-3 pointer-events-auto bg-surface-container-lowest/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-outline-variant/20 shadow-md">
+      <div className="absolute top-3 left-3 right-3 z-30 flex items-start justify-between gap-3 pointer-events-none">
+        <div className="flex items-center gap-3 pointer-events-auto bg-surface-container-lowest/78 backdrop-blur-xl px-3 py-2 rounded-xl border border-outline-variant/20 shadow-lg shadow-black/15">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-primary" />
             <span className="text-[12px] font-semibold tracking-wider text-on-surface uppercase">Arabian Sea Basin</span>
@@ -633,7 +644,7 @@ export default function Console() {
         </div>
 
         <div className="flex items-center gap-2 pointer-events-auto">
-          <div className="hidden md:flex items-center gap-2 bg-surface-container-lowest/80 backdrop-blur-md px-3 py-1.5 rounded-lg border border-outline-variant/20 shadow-md font-mono text-[12px]">
+          <div className="hidden md:flex items-center gap-2 bg-surface-container-lowest/78 backdrop-blur-xl px-3 py-2 rounded-xl border border-outline-variant/20 shadow-lg shadow-black/15 font-mono text-[12px]">
             <span className="text-on-surface-variant">Comparison:</span>
             <div className="flex gap-1">
               <button
@@ -714,7 +725,7 @@ export default function Console() {
 
       {/* Stats Bar (earth view, non-presentation) */}
       {!presMode && viewMode === 'earth' && (
-        <StatsBar floatData={cesiumFloatData} filters={filters} anomalyMode={anomalyMode} />
+        <StatsBar floatData={cesiumFloatData} />
       )}
 
       {/* Find Interesting Region button (earth view, non-presentation) */}
@@ -733,89 +744,99 @@ export default function Console() {
 
       {/* Left rail for Layer view controls */}
       {!presMode && viewMode === 'layers' && (
-      <div className="absolute top-14 left-3 z-20 w-64 max-w-[calc(100vw-1.5rem)] max-h-[calc(100vh-5rem)] overflow-y-auto pr-1 flex flex-col gap-3 pointer-events-auto">
-        <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
-          <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Variable</span>
-          <div className="flex gap-1.5">
-            <button className="flex-1 py-1.5 px-2 bg-primary/10 border border-primary text-primary text-[12px] font-semibold rounded transition-colors">
+      <div className="absolute top-[4.75rem] left-4 z-20 w-56 max-w-[calc(100vw-2rem)] pointer-events-auto">
+        <div className="bg-surface-container-lowest/82 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 overflow-hidden">
+          <div className="px-4 pt-3.5 pb-3 border-b border-outline-variant/15">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-primary/80">Layer controls</span>
+                <h2 className="mt-1 text-[14px] font-semibold text-on-surface">Explore the water column</h2>
+              </div>
+              <span className="material-symbols-outlined text-[18px] text-on-surface-variant/70">tune</span>
+            </div>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-on-surface-variant/70">Choose a field and depth. The surface updates from the loaded GODAS grid.</p>
+          </div>
+
+          <div className="p-3 space-y-4">
+            <div>
+              <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Field</span>
+              <div className="mt-2 grid grid-cols-2 gap-1.5">
+                <button aria-pressed="true" className="py-2 px-2 bg-primary/12 border border-primary/70 text-primary text-[11px] font-semibold rounded-lg transition-colors">
               Temperature
-            </button>
-            <button
-              onClick={() => { setMapMode('currents'); setViewMode('earth') }}
-              className="flex-1 py-1.5 px-2 bg-transparent border border-outline-variant/30 text-on-surface-variant text-[12px] font-semibold rounded hover:border-primary hover:text-primary transition-colors cursor-pointer"
-            >
+                </button>
+                <button
+                  onClick={() => { setMapMode('currents'); setViewMode('earth') }}
+                  className="py-2 px-2 bg-transparent border border-outline-variant/25 text-on-surface-variant text-[11px] font-semibold rounded-lg hover:border-primary/70 hover:text-primary transition-colors cursor-pointer"
+                >
               Currents
-            </button>
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Depth layer</span>
+                <span className="text-[10px] font-mono text-primary">{availableDepths[activeDepthIdx]?.depth_m || 5} m</span>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-1.5">
+                {availableDepths.map((d, i) => (
+                  <button
+                    key={d.depth_index}
+                    onClick={() => setActiveDepthIdx(i)}
+                    className={`text-left py-2 px-2 text-[10px] rounded-lg border transition-colors cursor-pointer ${
+                      i === activeDepthIdx
+                        ? 'bg-primary/10 border-primary/75 text-on-surface'
+                        : 'bg-surface-container/35 border-outline-variant/20 text-on-surface-variant hover:border-primary/60 hover:text-on-surface'
+                    }`}
+                  >
+                    <span className="block">{depthLabels[i] || 'Layer ' + i}</span>
+                    <span className="block mt-0.5 text-[9px] text-on-surface-variant/60">{d.depth_m} m</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="pt-1">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Timeline</span>
+                <span className="text-[10px] font-mono text-on-surface-variant">Day {activeDay} / {totalDays}</span>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <button
+                  onClick={() => setPlaying(!playing)}
+                  aria-label={playing ? 'Pause timeline' : 'Play timeline'}
+                  className="w-8 h-8 rounded-full border border-primary/50 bg-primary/10 text-primary flex items-center justify-center hover:bg-primary/20 transition-colors cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[17px]">{playing ? 'pause' : 'play_arrow'}</span>
+                </button>
+                <input
+                  type="range"
+                  min={1}
+                  max={totalDays}
+                  value={activeDay}
+                  onChange={(e) => setActiveDay(parseInt(e.target.value))}
+                  aria-label="Timeline day"
+                  className="flex-1 accent-primary h-1 bg-outline-variant/30 rounded-lg cursor-pointer"
+                />
+              </div>
+            </div>
           </div>
         </div>
-
-        <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
-          <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Depth Layer</span>
-          <div className="flex flex-col gap-1.5">
-            {availableDepths.map((d, i) => (
-              <button
-                key={d.depth_index}
-                onClick={() => setActiveDepthIdx(i)}
-                className={`text-left py-1.5 px-2 text-[12px] rounded border transition-colors ${
-                  i === activeDepthIdx
-                    ? 'bg-primary/10 border-primary text-on-surface'
-                    : 'bg-transparent border-outline-variant/30 text-on-surface-variant hover:border-primary hover:text-on-surface'
-                }`}
-              >
-                {depthLabels[i] || 'Layer ' + i}
-                <span className="ml-2 text-[10px] text-on-surface-variant">{d.depth_m}m</span>
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
-          <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Day</span>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setPlaying(!playing)}
-              className="w-7 h-7 rounded-full border border-outline-variant/30 bg-transparent text-on-surface flex items-center justify-center hover:border-primary transition-colors cursor-pointer"
-            >
-              <span className="material-symbols-outlined text-[16px]">{playing ? 'pause' : 'play_arrow'}</span>
-            </button>
-            <input
-              type="range"
-              min={1}
-              max={totalDays}
-              value={activeDay}
-              onChange={(e) => setActiveDay(parseInt(e.target.value))}
-              className="flex-1 accent-primary h-1 bg-outline-variant/30 rounded-lg cursor-pointer"
-            />
-          </div>
-          <span className="text-[11px] font-mono text-on-surface-variant mt-1 block">Day {activeDay} / {totalDays}</span>
-        </div>
-
-        <div className="bg-surface-container-lowest/80 backdrop-blur-md p-3 rounded-lg border border-outline-variant/20 shadow-md">
-          <span className="text-[11px] font-mono text-on-surface-variant block mb-2">Scale</span>
-          <div className="h-2 rounded bg-gradient-to-r from-[#274e8c] via-[#2fb6a8] via-[#f2a65a] to-[#e4572e]" />
-          <div className="flex justify-between text-[10px] font-mono text-on-surface-variant mt-1">
-            <span>Cold</span><span>Warm</span>
-          </div>
-        </div>
-
-        <p className="text-[11px] text-on-surface-variant/50 font-mono leading-relaxed">
-          Drag to orbit, scroll to zoom. Click a float marker to inspect.
-        </p>
       </div>
       )}
 
       {/* Layer telemetry keeps the API-backed field readable while exploring depth. */}
       {!presMode && viewMode === 'layers' && (
-        <div className="absolute right-3 bottom-16 z-20 w-64 max-w-[calc(100vw-1.5rem)] bg-surface-container-lowest/85 backdrop-blur-md rounded-lg border border-outline-variant/20 shadow-md p-3 pointer-events-none">
+        <div className="hidden md:block absolute right-4 bottom-5 z-20 w-56 max-w-[calc(100vw-2rem)] bg-surface-container-lowest/78 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 p-3.5 pointer-events-none">
           <div className="flex items-center justify-between mb-2">
             <span className="text-[10px] font-mono text-on-surface-variant/70 uppercase tracking-widest">Live field</span>
             <span className="text-[10px] font-mono text-primary">GODAS + ARGO</span>
           </div>
-          <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">GRID POINTS</span><span className="text-on-surface">{gridPointCount.toLocaleString()}</span></div>
-            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">FLOATS</span><span className="text-primary">{floatCount.toLocaleString()}</span></div>
-            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">LAYERS</span><span className="text-on-surface">{availableDepths.length}</span></div>
-            <div className="bg-surface-container/70 rounded px-2 py-1.5"><span className="block text-on-surface-variant/60">DAY</span><span className="text-on-surface">{activeDay} / {totalDays}</span></div>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2 text-[10px] font-mono">
+            <div><span className="block text-[9px] text-on-surface-variant/60">GRID POINTS</span><span className="text-on-surface">{gridPointCount.toLocaleString()}</span></div>
+            <div><span className="block text-[9px] text-on-surface-variant/60">FLOATS</span><span className="text-primary">{floatCount.toLocaleString()}</span></div>
+            <div><span className="block text-[9px] text-on-surface-variant/60">LAYERS</span><span className="text-on-surface">{availableDepths.length}</span></div>
+            <div><span className="block text-[9px] text-on-surface-variant/60">DAY</span><span className="text-on-surface">{activeDay} / {totalDays}</span></div>
           </div>
         </div>
       )}
@@ -823,11 +844,6 @@ export default function Console() {
       {/* Map Legend */}
       {!presMode && viewMode === 'earth' && (
         <MapLegend variable={legendVariable} />
-      )}
-
-      {/* Anomaly Toggle */}
-      {!presMode && viewMode === 'earth' && (
-        <AnomalyToggle anomalyMode={anomalyMode} onToggle={handleAnomalyToggle} />
       )}
 
       {/* Float Tooltip (hover) */}
@@ -850,7 +866,7 @@ export default function Console() {
           trajectoryVisible={showTrajectory}
           onCompareGodas={(_float) => {
             setComparisonMode('difference')
-            setMapMode('floats')
+            setMapMode('density')
           }}
         />
       )}
@@ -876,7 +892,7 @@ export default function Console() {
       )}
 
       {/* Bottom dock */}
-      {!presMode && (
+      {!presMode && viewMode === 'earth' && (
       <footer className="absolute bottom-0 left-0 right-0 h-12 z-30 bg-surface-container-lowest/95 backdrop-blur px-4 flex items-center justify-between border-t border-outline-variant/20">
         <div className="flex items-center gap-3">
           <button

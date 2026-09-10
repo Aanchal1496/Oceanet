@@ -47,5 +47,6 @@
     overscroll-behavior: none;
     background: #051522;
     color: #d4e4f8;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
   }
 }

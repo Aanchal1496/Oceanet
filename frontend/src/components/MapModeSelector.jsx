@@ -1,13 +1,8 @@
 const MAP_MODES = [
-  { label: 'Floats', value: 'floats', icon: 'water' },
   { label: 'Density', value: 'density', icon: 'grid_view' },
   { label: 'Temperature', value: 'temperature', icon: 'thermostat' },
   { label: 'Salinity', value: 'salinity', icon: 'science' },
-  { label: 'Oxygen', value: 'oxygen', icon: 'air' },
-  { label: 'Pressure', value: 'pressure', icon: 'compress' },
-  { label: 'Currents', value: 'currents', icon: 'airwave' },
-  { label: 'Anomaly', value: 'anomaly', icon: 'warning' },
-  { label: 'Trajectories', value: 'trajectories', icon: 'route' },
+  { label: 'Currents', value: 'currents', icon: 'waves' },
 ]
 
 export default function MapModeSelector({ activeMode, onModeChange }) {
