@@ -2,10 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
 import { getDates, getDepths, getGrid, getFloats, getCurrents } from '../services/api'
 import CesiumView from '../components/CesiumView'
-import LeftFilterPanel from '../components/LeftFilterPanel'
 import FloatDetailsPanel from '../components/FloatDetailsPanel'
 import MapLegend from '../components/MapLegend'
-import Timeline from '../components/Timeline'
 import MapModeSelector from '../components/MapModeSelector'
 import FloatTooltip from '../components/FloatTooltip'
 import StatsBar from '../components/StatsBar'
@@ -49,20 +47,16 @@ export default function Console() {
   const [activeDepthIdx, setActiveDepthIdx] = useState(0)
   const [activeDay, setActiveDay] = useState(1)
   const [totalDays, setTotalDays] = useState(1)
-  const [dates, setDates] = useState([])
   const [playing, setPlaying] = useState(false)
   const [disclaimer, setDisclaimer] = useState('Loading data from API...')
   const [selectedFloat, setSelectedFloat] = useState(null)
-  const [viewMode, setViewMode] = useState('earth')
+  const [viewMode, setViewMode] = useState('layers')
   const [presMode, setPresMode] = useState(false)
   const playRef = useRef(null)
   const activeDepthIdxRef = useRef(0)
 
   // New state for research UX
   const [filters, setFilters] = useState(DEFAULT_FILTERS)
-  const [filterCollapsed, setFilterCollapsed] = useState(() => (
-    typeof window !== 'undefined' && window.innerWidth < 768
-  ))
   const [mapMode, setMapMode] = useState('density')
   const [anomalyMode, setAnomalyMode] = useState('all')
   const [hoveredFloat, setHoveredFloat] = useState(null)
@@ -406,7 +400,6 @@ export default function Console() {
         if (cancelled) return
         const numDays = datesResp.dates.length
         setTotalDays(numDays)
-        setDates(datesResp.dates)
 
         const depthResp = await getDepths(1)
         if (cancelled) return
@@ -552,15 +545,6 @@ export default function Console() {
     setFilters(prev => ({ ...prev, anomalyMode: 'all' }))
   }, [])
 
-  const handleFiltersChange = useCallback((nextFilters) => {
-    const variableChanged = nextFilters.variable !== filters.variable
-    setFilters(nextFilters)
-    if (variableChanged && ['temperature', 'salinity'].includes(nextFilters.variable)) {
-      setMapMode(nextFilters.variable)
-    }
-    setAnomalyMode(nextFilters.anomalyMode || 'all')
-  }, [filters.variable])
-
   // Handler for finding interesting regions
   const handleFindRegions = useCallback((regions) => {
     setFoundRegions(regions)
@@ -689,7 +673,7 @@ export default function Console() {
 
       {/* 3D Earth View (Cesium) */}
       {viewMode === 'earth' && (
-        <div className="absolute inset-0 z-0 md:left-64" style={{ height: '100%' }}>
+        <div className="absolute inset-0 z-0" style={{ height: '100%' }}>
           <CesiumView
             ref={cesiumRef}
             floatData={cesiumFloatData}
@@ -705,17 +689,6 @@ export default function Console() {
             comparisonMode={comparisonMode}
           />
         </div>
-      )}
-
-      {/* Left Filter Panel belongs to the Earth map; Layer View has its own depth rail. */}
-      {!presMode && viewMode === 'earth' && (
-        <LeftFilterPanel
-          filters={filters}
-          onFilterChange={handleFiltersChange}
-          collapsed={filterCollapsed}
-          onToggleCollapse={() => setFilterCollapsed(!filterCollapsed)}
-          availableDepths={availableDepths}
-        />
       )}
 
       {/* Map Mode Selector (earth view only, non-presentation) */}
@@ -742,87 +715,87 @@ export default function Console() {
         />
       )}
 
-      {/* Left rail for Layer view controls */}
+      {/* Layer controls are shown only for the 3D layer view. */}
       {!presMode && viewMode === 'layers' && (
-      <div className="absolute top-[4.75rem] left-4 z-20 w-56 max-w-[calc(100vw-2rem)] pointer-events-auto">
-        <div className="bg-surface-container-lowest/82 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 overflow-hidden">
-          <div className="px-4 pt-3.5 pb-3 border-b border-outline-variant/15">
-            <div className="flex items-start justify-between gap-3">
+        <div className="absolute top-[4.75rem] left-4 z-20 w-56 max-w-[calc(100vw-2rem)] pointer-events-auto">
+          <div className="bg-surface-container-lowest/82 backdrop-blur-xl rounded-2xl border border-outline-variant/20 shadow-2xl shadow-black/20 overflow-hidden">
+            <div className="px-4 pt-3.5 pb-3 border-b border-outline-variant/15">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-primary/80">Layer controls</span>
+                  <h2 className="mt-1 text-[14px] font-semibold text-on-surface">Explore the water column</h2>
+                </div>
+                <span className="material-symbols-outlined text-[18px] text-on-surface-variant/70">tune</span>
+              </div>
+              <p className="mt-1.5 text-[10px] leading-relaxed text-on-surface-variant/70">Choose a field and depth. The surface updates from the loaded GODAS grid.</p>
+            </div>
+
+            <div className="p-3 space-y-4">
               <div>
-                <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-primary/80">Layer controls</span>
-                <h2 className="mt-1 text-[14px] font-semibold text-on-surface">Explore the water column</h2>
-              </div>
-              <span className="material-symbols-outlined text-[18px] text-on-surface-variant/70">tune</span>
-            </div>
-            <p className="mt-1.5 text-[10px] leading-relaxed text-on-surface-variant/70">Choose a field and depth. The surface updates from the loaded GODAS grid.</p>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div>
-              <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Field</span>
-              <div className="mt-2 grid grid-cols-2 gap-1.5">
-                <button aria-pressed="true" className="py-2 px-2 bg-primary/12 border border-primary/70 text-primary text-[11px] font-semibold rounded-lg transition-colors">
-              Temperature
-                </button>
-                <button
-                  onClick={() => { setMapMode('currents'); setViewMode('earth') }}
-                  className="py-2 px-2 bg-transparent border border-outline-variant/25 text-on-surface-variant text-[11px] font-semibold rounded-lg hover:border-primary/70 hover:text-primary transition-colors cursor-pointer"
-                >
-              Currents
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Depth layer</span>
-                <span className="text-[10px] font-mono text-primary">{availableDepths[activeDepthIdx]?.depth_m || 5} m</span>
-              </div>
-              <div className="mt-2 grid grid-cols-2 gap-1.5">
-                {availableDepths.map((d, i) => (
-                  <button
-                    key={d.depth_index}
-                    onClick={() => setActiveDepthIdx(i)}
-                    className={`text-left py-2 px-2 text-[10px] rounded-lg border transition-colors cursor-pointer ${
-                      i === activeDepthIdx
-                        ? 'bg-primary/10 border-primary/75 text-on-surface'
-                        : 'bg-surface-container/35 border-outline-variant/20 text-on-surface-variant hover:border-primary/60 hover:text-on-surface'
-                    }`}
-                  >
-                    <span className="block">{depthLabels[i] || 'Layer ' + i}</span>
-                    <span className="block mt-0.5 text-[9px] text-on-surface-variant/60">{d.depth_m} m</span>
+                <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Field</span>
+                <div className="mt-2 grid grid-cols-2 gap-1.5">
+                  <button aria-pressed="true" className="py-2 px-2 bg-primary/12 border border-primary/70 text-primary text-[11px] font-semibold rounded-lg transition-colors">
+                    Temperature
                   </button>
-                ))}
+                  <button
+                    onClick={() => { setMapMode('currents'); setViewMode('earth') }}
+                    className="py-2 px-2 bg-transparent border border-outline-variant/25 text-on-surface-variant text-[11px] font-semibold rounded-lg hover:border-primary/70 hover:text-primary transition-colors cursor-pointer"
+                  >
+                    Currents
+                  </button>
+                </div>
               </div>
-            </div>
 
-            <div className="pt-1">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Timeline</span>
-                <span className="text-[10px] font-mono text-on-surface-variant">Day {activeDay} / {totalDays}</span>
+              <div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Depth layer</span>
+                  <span className="text-[10px] font-mono text-primary">{availableDepths[activeDepthIdx]?.depth_m || 5} m</span>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-1.5">
+                  {availableDepths.map((d, i) => (
+                    <button
+                      key={d.depth_index}
+                      onClick={() => setActiveDepthIdx(i)}
+                      className={`text-left py-2 px-2 text-[10px] rounded-lg border transition-colors cursor-pointer ${
+                        i === activeDepthIdx
+                          ? 'bg-primary/10 border-primary/75 text-on-surface'
+                          : 'bg-surface-container/35 border-outline-variant/20 text-on-surface-variant hover:border-primary/60 hover:text-on-surface'
+                      }`}
+                    >
+                      <span className="block">{depthLabels[i] || 'Layer ' + i}</span>
+                      <span className="block mt-0.5 text-[9px] text-on-surface-variant/60">{d.depth_m} m</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="flex items-center gap-2.5">
-                <button
-                  onClick={() => setPlaying(!playing)}
-                  aria-label={playing ? 'Pause timeline' : 'Play timeline'}
-                  className="w-8 h-8 rounded-full border border-primary/50 bg-primary/10 text-primary flex items-center justify-center hover:bg-primary/20 transition-colors cursor-pointer"
-                >
-                  <span className="material-symbols-outlined text-[17px]">{playing ? 'pause' : 'play_arrow'}</span>
-                </button>
-                <input
-                  type="range"
-                  min={1}
-                  max={totalDays}
-                  value={activeDay}
-                  onChange={(e) => setActiveDay(parseInt(e.target.value))}
-                  aria-label="Timeline day"
-                  className="flex-1 accent-primary h-1 bg-outline-variant/30 rounded-lg cursor-pointer"
-                />
+
+              <div className="pt-1">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-on-surface-variant/65">Timeline</span>
+                  <span className="text-[10px] font-mono text-on-surface-variant">Day {activeDay} / {totalDays}</span>
+                </div>
+                <div className="flex items-center gap-2.5">
+                  <button
+                    onClick={() => setPlaying(!playing)}
+                    aria-label={playing ? 'Pause timeline' : 'Play timeline'}
+                    className="w-8 h-8 rounded-full border border-primary/50 bg-primary/10 text-primary flex items-center justify-center hover:bg-primary/20 transition-colors cursor-pointer"
+                  >
+                    <span className="material-symbols-outlined text-[17px]">{playing ? 'pause' : 'play_arrow'}</span>
+                  </button>
+                  <input
+                    type="range"
+                    min={1}
+                    max={totalDays}
+                    value={activeDay}
+                    onChange={(e) => setActiveDay(parseInt(e.target.value))}
+                    aria-label="Timeline day"
+                    className="flex-1 accent-primary h-1 bg-outline-variant/30 rounded-lg cursor-pointer"
+                  />
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
       )}
 
       {/* Layer telemetry keeps the API-backed field readable while exploring depth. */}
@@ -878,17 +851,6 @@ export default function Console() {
           {disclaimer}
         </div>
       </div>
-      )}
-
-      {/* Timeline (earth view, non-presentation) */}
-      {!presMode && viewMode === 'earth' && (
-        <Timeline
-          dates={dates}
-          activeDay={activeDay}
-          onDayChange={setActiveDay}
-          playing={playing}
-          onPlayToggle={() => setPlaying(!playing)}
-        />
       )}
 
       {/* Bottom dock */}

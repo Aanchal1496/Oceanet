@@ -29,7 +29,7 @@ export default function StatsBar({ floatData }) {
   ]
 
   return (
-    <div className="absolute top-24 md:top-14 left-3 md:left-64 z-20 pointer-events-auto">
+    <div className="absolute top-24 md:top-14 left-3 z-20 pointer-events-auto">
       <div className="bg-surface-container-lowest/85 backdrop-blur-md rounded-lg border border-outline-variant/20 shadow-md px-3 py-2.5">
         <div className="flex items-center gap-4">
           {stats.map((stat) => (
